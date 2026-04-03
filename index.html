@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rekordport</title>
+    <meta
+      name="description"
+      content="Scan Rekordbox master.db for FLAC and high-bit-depth WAV/AIFF tracks."
+    />
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body>
+    <div class="backdrop backdrop-a"></div>
+    <div class="backdrop backdrop-b"></div>
+    <div class="noise-layer"></div>
+    <div class="window-drag-bar" data-tauri-drag-region aria-hidden="true"></div>
+
+    <main class="shell">
+      <section class="panel scan-panel">
+        <div class="scan-grid">
+          <div class="field-group">
+            <label for="db-path">master.db Path</label>
+            <div class="field-row">
+              <input id="db-path" type="text" spellcheck="false" />
+              <button class="ghost" id="pick-db">Choose Database…</button>
+              <button id="scan" class="primary">Scan Library</button>
+            </div>
+          </div>
+          <label class="toggle compact-toggle">
+            <input id="include-sampler" type="checkbox" />
+            <span>Ignore rekordbox sampler kits</span>
+          </label>
+          <div class="scan-status">
+            <div class="status-pill" id="status-pill">Ready</div>
+            <div class="status-meta" id="status-meta" hidden></div>
+          </div>
+        </div>
+
+        <div class="scan-progress" id="scan-progress" hidden>
+          <progress id="scan-progress-bar" max="100"></progress>
+          <div class="scan-progress-text" id="scan-progress-text">Reading rekordbox database…</div>
+        </div>
+      </section>
+
+      <section class="panel results-panel">
+        <div class="panel-title results-title">
+          <div>
+            <h2>Scan Results</h2>
+            <p id="results-caption">Not scanned yet.</p>
+          </div>
+          <div class="results-meta" id="results-meta"></div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="check-col">
+                  <input id="select-all" type="checkbox" />
+                </th>
+                <th class="preview-col"></th>
+                <th>Title</th>
+                <th>Artist</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Audio</th>
+                <th>Path</th>
+              </tr>
+            </thead>
+            <tbody id="results-body">
+              <tr class="empty-row">
+                <td colspan="8">Click “Scan Library” to begin.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <section class="player-panel">
+          <div class="player-meter">
+          <button class="primary player-play" id="player-play" disabled>Play</button>
+            <span id="player-current">0:00</span>
+            <input id="player-seek" type="range" min="0" max="0" value="0" step="0.1" disabled />
+            <span id="player-total">0:00</span>
+          </div>
+
+          <audio id="preview-audio" preload="metadata"></audio>
+        </section>
+      </section>
+
+      <section class="panel export-panel">
+        <div class="export-toolbar">
+          <div class="inline-field format-field">
+            <label for="preset">Output Format</label>
+            <select id="preset">
+              <option value="wav-auto">WAV</option>
+              <option value="aiff-auto">AIFF</option>
+              <option value="mp3-320">MP3 320kbps</option>
+              <option value="m4a-320">M4A 320kbps</option>
+            </select>
+          </div>
+
+          <div class="inline-field source-field">
+            <label for="source-handling">Source Handling</label>
+            <select id="source-handling">
+              <option value="rename">Rename and keep in folder</option>
+              <option value="trash">Move to Trash</option>
+            </select>
+          </div>
+
+          <button id="convert" class="primary" disabled>Convert Selected</button>
+          <div class="footer-copy" id="footer-copy" hidden>
+            A backup is created before conversion, then rekordbox paths, playlist links, and analysis resources are updated.
+          </div>
+        </div>
+
+        <div class="export-progress" id="export-progress" hidden>
+          <progress id="export-progress-bar" max="100"></progress>
+          <div class="export-progress-text" id="export-progress-text">Preparing conversion…</div>
+        </div>
+
+        <div class="footer-note" id="footer-note">Checking local dependencies…</div>
+        <div class="footer-error" id="footer-error" hidden></div>
+      </section>
+    </main>
+  </body>
+</html>

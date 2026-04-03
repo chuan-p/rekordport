@@ -1,0 +1,77 @@
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$binDir = Join-Path $repoRoot "src-tauri/bin"
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "rekordport-windows-sidecars"
+$ffmpegZip = Join-Path $tempRoot "ffmpeg.zip"
+$ffmpegExtractDir = Join-Path $tempRoot "ffmpeg"
+$sqlcipherTemp = Join-Path $tempRoot "sqlcipher.exe"
+
+$ffmpegUrl = if ($env:RKB_FFMPEG_WINDOWS_URL) {
+  $env:RKB_FFMPEG_WINDOWS_URL
+} else {
+  "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-lgpl.zip"
+}
+
+$sqlcipherUrl = if ($env:RKB_SQLCIPHER_WINDOWS_URL) {
+  $env:RKB_SQLCIPHER_WINDOWS_URL
+} else {
+  "https://raw.githubusercontent.com/Katecca/sqlcipher-static-binary/master/windows/x86_64/sqlcipher.exe"
+}
+
+function New-CleanDirectory([string]$Path) {
+  if (Test-Path $Path) {
+    Remove-Item -LiteralPath $Path -Recurse -Force
+  }
+  New-Item -ItemType Directory -Path $Path -Force | Out-Null
+}
+
+function Invoke-Download([string]$Url, [string]$OutFile) {
+  Write-Host "Downloading $Url"
+  Invoke-WebRequest -Uri $Url -Headers @{ "User-Agent" = "rekordport-build" } -OutFile $OutFile
+}
+
+function Assert-OptionalSha256([string]$FilePath, [string]$ExpectedHash, [string]$Label) {
+  if ([string]::IsNullOrWhiteSpace($ExpectedHash)) {
+    return
+  }
+
+  $actualHash = (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actualHash -ne $ExpectedHash.ToLowerInvariant()) {
+    throw "$Label SHA256 mismatch. expected=$ExpectedHash actual=$actualHash"
+  }
+}
+
+function Copy-RequiredTool([string]$SourcePath, [string]$TargetName) {
+  $targetPath = Join-Path $binDir $TargetName
+  Copy-Item -LiteralPath $SourcePath -Destination $targetPath -Force
+  Write-Host "Prepared $targetPath"
+}
+
+New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+New-CleanDirectory $tempRoot
+New-CleanDirectory $ffmpegExtractDir
+
+Invoke-Download $ffmpegUrl $ffmpegZip
+Assert-OptionalSha256 $ffmpegZip $env:RKB_FFMPEG_WINDOWS_SHA256 "ffmpeg archive"
+Expand-Archive -LiteralPath $ffmpegZip -DestinationPath $ffmpegExtractDir -Force
+
+$ffmpegExe = Get-ChildItem -Path $ffmpegExtractDir -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
+$ffprobeExe = Get-ChildItem -Path $ffmpegExtractDir -Filter "ffprobe.exe" -Recurse | Select-Object -First 1
+
+if (-not $ffmpegExe) {
+  throw "ffmpeg.exe was not found in $ffmpegUrl"
+}
+if (-not $ffprobeExe) {
+  throw "ffprobe.exe was not found in $ffmpegUrl"
+}
+
+Copy-RequiredTool $ffmpegExe.FullName "ffmpeg-x86_64-pc-windows-msvc.exe"
+Copy-RequiredTool $ffprobeExe.FullName "ffprobe-x86_64-pc-windows-msvc.exe"
+
+Invoke-Download $sqlcipherUrl $sqlcipherTemp
+Assert-OptionalSha256 $sqlcipherTemp $env:RKB_SQLCIPHER_WINDOWS_SHA256 "sqlcipher binary"
+Copy-RequiredTool $sqlcipherTemp "sqlcipher-x86_64-pc-windows-msvc.exe"
+
+Write-Host "Windows sidecars are ready in $binDir"

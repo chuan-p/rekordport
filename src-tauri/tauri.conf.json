@@ -1,0 +1,67 @@
+{
+  "$schema": "../gen/schemas/tauri-schema.json",
+  "productName": "rekordport",
+  "version": "0.1.0",
+  "identifier": "com.chuanpeng.rekordboxlosslessscan",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$HOME/**",
+          "$DESKTOP/**",
+          "$DOCUMENT/**",
+          "$DOWNLOAD/**",
+          "$PUBLIC/**",
+          "$TEMP/**",
+          "/Volumes/**",
+          "C:/**",
+          "D:/**",
+          "E:/**",
+          "F:/**"
+        ]
+      }
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "rekordport",
+        "width": 1180,
+        "height": 820,
+        "minWidth": 920,
+        "minHeight": 680,
+        "resizable": true,
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 18
+        }
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": [
+      "bin/sqlcipher",
+      "bin/ffmpeg",
+      "bin/ffprobe"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

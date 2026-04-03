@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.codex/
+exports/
+__pycache__/
+*.pyc
+.env
+.env.*
+src-tauri/target/
+src-tauri/gen/
+src-tauri/tauri.generated.conf.json
+src-tauri/bin/*
+!src-tauri/bin/README.md
+.DS_Store
