@@ -1,7 +1,19 @@
-name: build-windows
+name: build-windows-exe
 
 on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -34,11 +46,59 @@ jobs:
       - name: Build Windows installer
         run: npm run tauri build -- --bundles nsis
 
-      - name: Upload installer artifact
+      - name: Locate installer
+        id: installer
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) {
+            throw "No NSIS .exe installer was produced."
+          }
+
+          $zip = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.zip" | Select-Object -First 1
+
+          "exe_path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "exe_name=$($exe.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($zip) {
+            "zip_path=$($zip.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Upload Windows installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rekordport-windows-x64
+          name: rekordport-windows-exe-${{ github.run_number }}
           path: |
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/nsis/*.zip
+            ${{ steps.installer.outputs.exe_path }}
+            ${{ steps.installer.outputs.zip_path }}
             src-tauri/bin/*-x86_64-pc-windows-msvc.exe
+
+      - name: Add build summary
+        shell: pwsh
+        run: |
+          @"
+          ## Windows build ready
+
+          - Installer: `${{ steps.installer.outputs.exe_name }}`
+          - Ref: `${{ github.ref_name }}`
+          - Run: `${{ github.run_number }}`
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Attach installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $exe = "${{ steps.installer.outputs.exe_path }}"
+          $zip = "${{ steps.installer.outputs.zip_path }}"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --notes "Automated Windows installer build."
+          }
+
+          gh release upload $tag $exe --clobber
+          if ($zip) {
+            gh release upload $tag $zip --clobber
+          }

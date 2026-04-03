@@ -121,7 +121,11 @@ npm run tauri build -- --bundles nsis
 npm run tauri build -- --target x86_64-apple-darwin --bundles app
 ```
 
-如果你把仓库放到 GitHub 上，也可以直接跑 [.github/workflows/windows-build.yml](/Users/chuanpeng/Documents/rkb-lossless-process/.github/workflows/windows-build.yml) 里的 `workflow_dispatch`，让 `windows-latest` runner 产出安装包 artifact。
+如果你把仓库放到 GitHub 上，也可以直接用 [.github/workflows/windows-build.yml](/Users/chuanpeng/Documents/rkb-lossless-process/.github/workflows/windows-build.yml)：
+
+- 手动点 `workflow_dispatch`，生成 Windows `.exe` 安装包 artifact
+- 推送到 `main` 时自动构建一次，方便持续检查 Windows 打包没有坏
+- 推送 `v*` tag 时除了上传 artifact，还会把 `.exe` 自动挂到 GitHub Release
 
 构建时现在会自动只打包“当前目标平台实际存在”的 sidecar，并且先生成当前目标平台的可分发副本：
 
