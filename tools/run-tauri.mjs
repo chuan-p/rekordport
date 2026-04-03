@@ -147,6 +147,7 @@ const tauri = spawnSync(tauriBin, tauriArgs, {
   cwd: repoRoot,
   env: childEnv,
   stdio: "inherit",
+  shell: process.platform === "win32",
 });
 
 if (tauri.status === 0 && command === "build") {
