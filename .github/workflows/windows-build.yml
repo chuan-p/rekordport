@@ -55,13 +55,8 @@ jobs:
             throw "No NSIS .exe installer was produced."
           }
 
-          $zip = Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.zip" | Select-Object -First 1
-
           "exe_path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "exe_name=$($exe.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          if ($zip) {
-            "zip_path=$($zip.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
 
       - name: Upload Windows installer artifact
         uses: actions/upload-artifact@v4
@@ -69,8 +64,6 @@ jobs:
           name: rekordport-windows-exe-${{ github.run_number }}
           path: |
             ${{ steps.installer.outputs.exe_path }}
-            ${{ steps.installer.outputs.zip_path }}
-            src-tauri/bin/*-x86_64-pc-windows-msvc.exe
 
       - name: Add build summary
         shell: pwsh
@@ -91,7 +84,6 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $exe = "${{ steps.installer.outputs.exe_path }}"
-          $zip = "${{ steps.installer.outputs.zip_path }}"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
@@ -99,6 +91,3 @@ jobs:
           }
 
           gh release upload $tag $exe --clobber
-          if ($zip) {
-            gh release upload $tag $zip --clobber
-          }
