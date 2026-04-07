@@ -120,16 +120,16 @@ npm run tauri build -- --target x86_64-apple-darwin --bundles app
 
 如果你把仓库放到 GitHub 上，也可以直接用 [.github/workflows/windows-build.yml](/Users/chuanpeng/Documents/rkb-lossless-process/.github/workflows/windows-build.yml)：
 
-- 手动点 `workflow_dispatch`，生成 Windows `.exe` 安装包 artifact
+- 手动点 `workflow_dispatch`，生成 Windows 便携版 `rekordport.exe` artifact，可以直接双击运行
 - 推送到 `main` 时自动构建一次，方便持续检查 Windows 打包没有坏
-- 推送 `v*` tag 时除了上传 artifact，还会把 `.exe` 自动挂到 GitHub Release
+- 推送 `v*` tag 时除了上传 artifact，还会把便携版 `.exe` 自动挂到 GitHub Release
 
-构建时现在会自动只打包“当前目标平台实际存在”的 sidecar，并且先生成当前目标平台的可分发副本：
+构建时现在会自动只打包“当前目标平台实际存在”的 sidecar，并且先生成当前目标平台的可分发副本。Windows x64 版还会把 `ffmpeg` / `sqlcipher` 嵌进主程序，启动时释放到临时目录调用，所以 GitHub Actions 上传的 artifact 只有一个 `rekordport.exe`：
 
-- 如果 `src-tauri/bin` 里已经有 `ffmpeg-x86_64-pc-windows-msvc.exe` / `sqlcipher-x86_64-pc-windows-msvc.exe`，它们会被自动收进安装包
+- 如果 `src-tauri/bin` 里已经有 `ffmpeg-x86_64-pc-windows-msvc.exe` / `sqlcipher-x86_64-pc-windows-msvc.exe`，它们会被自动收进安装包，并嵌入便携版主程序
 - 如果这些 Windows sidecar 还没放进去，构建也不会失败；应用运行时会继续按环境变量和系统 `PATH` 查找依赖
 - 因为大多数 Windows `ffmpeg` 不带 Apple 的 `aac_at` 编码器，`M4A 320kbps` 在 Windows 上通常不可用，预检里会直接提示
-- Windows 安装包使用 WebView2 在线 bootstrapper，避免内置离线安装器带来的约 127MB 体积；少数没有 WebView2 的机器首次安装需要联网
+- 便携版不会安装 WebView2；少数没有 WebView2 Runtime 的机器需要先安装 Microsoft WebView2 Runtime，或改用安装包方案
 - macOS 上如果 sidecar 来自 Homebrew 之类的动态链接构建，构建脚本会把它依赖的非系统 `.dylib` 一起收进 app 资源并改写加载路径，避免生成“只在开发机可运行”的假分发包
 
 仓库还附带了一个 sidecar 下载脚本 [tools/fetch-windows-sidecars.ps1](/Users/chuanpeng/Documents/rkb-lossless-process/tools/fetch-windows-sidecars.ps1)：

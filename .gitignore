@@ -8,6 +8,7 @@ __pycache__/
 .env.*
 release/windows-x64-portable/
 release/*-portable.zip
+release/rekordport.exe
 release/*-setup.exe
 release/*.exe.zip
 src-tauri/target/

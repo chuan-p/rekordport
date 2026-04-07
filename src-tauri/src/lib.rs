@@ -272,6 +272,47 @@ fn executable_filename(command: &str) -> String {
     }
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn embedded_windows_sidecar_bytes(command: &str) -> Option<&'static [u8]> {
+    match command {
+        "ffmpeg" => Some(include_bytes!("../bin/ffmpeg-x86_64-pc-windows-msvc.exe")),
+        "sqlcipher" => Some(include_bytes!(
+            "../bin/sqlcipher-x86_64-pc-windows-msvc.exe"
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn embedded_windows_sidecar_bytes(_command: &str) -> Option<&'static [u8]> {
+    None
+}
+
+fn embedded_windows_sidecar_path(command: &str) -> Option<PathBuf> {
+    let bytes = embedded_windows_sidecar_bytes(command)?;
+    let digest = format!("{:x}", md5::compute(bytes));
+    let path = embedded_windows_sidecar_root()
+        .join(target_triple())
+        .join(format!("{command}-{digest}.exe"));
+
+    let needs_write = match fs::metadata(&path) {
+        Ok(meta) => meta.len() != bytes.len() as u64,
+        Err(_) => true,
+    };
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok()?;
+        }
+        fs::write(&path, bytes).ok()?;
+    }
+
+    Some(path)
+}
+
+fn embedded_windows_sidecar_root() -> PathBuf {
+    env::temp_dir().join("rekordport-sidecars")
+}
+
 fn candidate_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
@@ -537,6 +578,12 @@ fn resolve_command(command: &str) -> Option<PathBuf> {
             }
         }
 
+        if let Some(candidate) = embedded_windows_sidecar_path(command) {
+            if command_exists_at(&candidate) {
+                return Some(candidate);
+            }
+        }
+
         if command_exists(command) {
             return Some(PathBuf::from(command));
         }
@@ -572,6 +619,8 @@ fn command_source(command: &str) -> Option<String> {
 
     if is_bundled_command_path(&resolved) {
         Some(format!("bundled sidecar ({})", resolved.display()))
+    } else if resolved.starts_with(embedded_windows_sidecar_root()) {
+        Some(format!("embedded sidecar ({})", resolved.display()))
     } else if resolved.components().count() == 1 {
         Some("system PATH".to_string())
     } else {
