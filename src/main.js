@@ -410,6 +410,50 @@ function togglePreviewPlay() {
   }
 }
 
+function waitForPreviewAudioRelease(audio) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      audio.removeEventListener("emptied", finish);
+      window.requestAnimationFrame(() => resolve());
+    };
+    const timeout = window.setTimeout(finish, 300);
+    audio.addEventListener("emptied", finish, { once: true });
+    audio.load();
+  });
+}
+
+async function releasePreviewAudio() {
+  const audio = els.previewAudio;
+  const previous = {
+    track: state.player.track,
+    wasPlaying: Boolean(state.player.track && !audio.paused && !audio.ended),
+  };
+  const hadSource = Boolean(audio.currentSrc || audio.src);
+
+  audio.pause();
+  audio.removeAttribute("src");
+  state.player.track = null;
+  state.player.currentTime = 0;
+  state.player.duration = 0;
+  state.player.loading = false;
+  state.player.seeking = false;
+  state.player.seekValue = 0;
+  renderPlayer();
+  renderResults();
+
+  if (hadSource) {
+    await waitForPreviewAudioRelease(audio);
+  } else {
+    audio.load();
+  }
+
+  return previous;
+}
+
 function summarizeTracks(tracks) {
   const flac = tracks.filter((t) => t.file_type === "FLAC").length;
   const alac = tracks.filter((t) => t.file_type === "ALAC").length;
@@ -653,6 +697,7 @@ async function convertSelected() {
 
   setError("");
   setLoading(true, "convert");
+  const previousPreview = await releasePreviewAudio();
   setConvertProgress({
     active: true,
     phase: "preparing",
@@ -681,14 +726,11 @@ async function convertSelected() {
         status: "converted",
       };
     });
-    if (state.player.track && convertedBySourceId.has(state.player.track.id)) {
-      state.player.track = convertedBySourceId.get(state.player.track.id);
-      els.previewAudio.src = convertFileSrc(state.player.track.full_path);
-      els.previewAudio.load();
-      if (!els.previewAudio.paused) {
-        els.previewAudio.play().catch(() => {});
-      }
-      renderPlayer();
+    if (previousPreview.track && convertedBySourceId.has(previousPreview.track.id)) {
+      await loadPreviewTrack(
+        convertedBySourceId.get(previousPreview.track.id),
+        previousPreview.wasPlaying,
+      );
     }
     state.selectedIds = new Set();
     state.conversionCompleted = true;

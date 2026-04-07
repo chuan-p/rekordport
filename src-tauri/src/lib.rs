@@ -2,13 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::fs::File;
+use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use tempfile::Builder as TempBuilder;
 use uuid::Uuid;
@@ -321,10 +322,144 @@ fn is_windows_unc_path(path: &Path) -> bool {
     }
 }
 
+fn is_windows_lock_error(error: &io::Error) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        matches!(error.raw_os_error(), Some(32) | Some(33))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn io_error_detail(error: &io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{error} (kind: {:?}, os error: {code})", error.kind()),
+        None => format!("{error} (kind: {:?})", error.kind()),
+    }
+}
+
+fn io_error_message(action: &str, error: &io::Error) -> String {
+    let mut message = format!("{action}: {}", io_error_detail(error));
+    if is_windows_lock_error(error) {
+        message.push_str(
+            ". Windows reports that the file is locked by another process. Close Rekordbox, Explorer preview panes, audio players, or any app previewing this file, then try again.",
+        );
+    }
+    message
+}
+
+fn retry_io_operation<T, F>(action: impl Into<String>, mut operation: F) -> Result<T, String>
+where
+    F: FnMut() -> io::Result<T>,
+{
+    let action = action.into();
+    let attempts = if cfg!(target_os = "windows") { 12 } else { 1 };
+
+    for attempt in 0..attempts {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if attempt + 1 < attempts && is_windows_lock_error(&error) {
+                    thread::sleep(Duration::from_millis(150));
+                    continue;
+                }
+                return Err(io_error_message(&action, &error));
+            }
+        }
+    }
+
+    unreachable!("retry loop always returns on success or final failure")
+}
+
+fn rename_path(source: &Path, destination: &Path) -> Result<(), String> {
+    retry_io_operation(
+        format!(
+            "failed to rename {} -> {}",
+            source.display(),
+            destination.display()
+        ),
+        || fs::rename(source, destination),
+    )
+}
+
+fn copy_path(source: &Path, destination: &Path) -> Result<u64, String> {
+    retry_io_operation(
+        format!(
+            "failed to copy {} -> {}",
+            source.display(),
+            destination.display()
+        ),
+        || fs::copy(source, destination),
+    )
+}
+
+fn remove_file_path(path: &Path) -> Result<(), String> {
+    retry_io_operation(format!("failed to remove {}", path.display()), || {
+        fs::remove_file(path)
+    })
+}
+
+fn create_dir_all_path(path: &Path) -> Result<(), String> {
+    retry_io_operation(
+        format!("failed to create directory {}", path.display()),
+        || fs::create_dir_all(path),
+    )
+}
+
+fn metadata_path(path: &Path) -> Result<fs::Metadata, String> {
+    retry_io_operation(
+        format!("failed to read metadata for {}", path.display()),
+        || fs::metadata(path),
+    )
+}
+
+fn path_exists(path: &Path) -> Result<bool, String> {
+    retry_io_operation(
+        format!("failed to check whether {} exists", path.display()),
+        || path.try_exists(),
+    )
+}
+
+fn read_path(path: &Path) -> Result<Vec<u8>, String> {
+    retry_io_operation(format!("failed to read {}", path.display()), || {
+        fs::read(path)
+    })
+}
+
+fn write_path(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
+    let bytes = bytes.as_ref();
+    retry_io_operation(format!("failed to write {}", path.display()), || {
+        fs::write(path, bytes)
+    })
+}
+
+fn open_file_path(path: &Path) -> Result<fs::File, String> {
+    retry_io_operation(format!("failed to open {}", path.display()), || {
+        fs::File::open(path)
+    })
+}
+
+fn create_file_path(path: &Path) -> Result<fs::File, String> {
+    retry_io_operation(format!("failed to create {}", path.display()), || {
+        fs::File::create(path)
+    })
+}
+
+fn read_dir_path(path: &Path) -> Result<fs::ReadDir, String> {
+    retry_io_operation(
+        format!("failed to read directory {}", path.display()),
+        || fs::read_dir(path),
+    )
+}
+
 fn preview_cache_path_for(source: &Path) -> Result<PathBuf, String> {
     let mut cache_root = std::env::temp_dir();
     cache_root.push("rekordport-preview-cache");
-    fs::create_dir_all(&cache_root).map_err(|e| e.to_string())?;
+    create_dir_all_path(&cache_root)?;
 
     let extension = source
         .extension()
@@ -336,10 +471,10 @@ fn preview_cache_path_for(source: &Path) -> Result<PathBuf, String> {
 
 fn prepare_preview_path_impl(path: String) -> Result<String, String> {
     let source = PathBuf::from(&path);
-    if !source.exists() {
+    if !path_exists(&source)? {
         return Err(format!("path not found: {}", source.display()));
     }
-    if !source.is_file() {
+    if !metadata_path(&source)?.is_file() {
         return Err(format!("preview path is not a file: {}", source.display()));
     }
 
@@ -348,14 +483,14 @@ fn prepare_preview_path_impl(path: String) -> Result<String, String> {
     }
 
     let cached = preview_cache_path_for(&source)?;
-    let source_meta = fs::metadata(&source).map_err(|e| e.to_string())?;
-    let needs_refresh = match fs::metadata(&cached) {
+    let source_meta = metadata_path(&source)?;
+    let needs_refresh = match metadata_path(&cached) {
         Ok(meta) => meta.len() != source_meta.len(),
         Err(_) => true,
     };
 
     if needs_refresh {
-        fs::copy(&source, &cached).map_err(|e| {
+        copy_path(&source, &cached).map_err(|e| {
             format!(
                 "failed to cache network preview file locally ({} -> {}): {}",
                 source.display(),
@@ -518,7 +653,9 @@ fn ffmpeg_has_encoder(name: &str) -> Result<bool, String> {
 
     let mut ffmpeg = prepared_command("ffmpeg")?;
     ffmpeg.args(["-hide_banner", "-encoders"]);
-    let output = ffmpeg.output().map_err(|e| e.to_string())?;
+    let output = ffmpeg
+        .output()
+        .map_err(|e| io_error_message("failed to run ffmpeg -encoders", &e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let available = stdout.lines().any(|line| line.contains(name));
@@ -544,7 +681,9 @@ fn probe_channels(path: &Path) -> Result<u32, String> {
         "default=noprint_wrappers=1:nokey=1",
     ]);
     ffprobe.arg(path);
-    let output = ffprobe.output().map_err(|e| e.to_string())?;
+    let output = ffprobe.output().map_err(|e| {
+        io_error_message(&format!("failed to run ffprobe on {}", path.display()), &e)
+    })?;
 
     if !output.status.success() {
         return Ok(2);
@@ -571,7 +710,9 @@ fn probe_sample_rate(path: &Path) -> Result<Option<u32>, String> {
         "default=noprint_wrappers=1:nokey=1",
     ]);
     ffprobe.arg(path);
-    let output = ffprobe.output().map_err(|e| e.to_string())?;
+    let output = ffprobe.output().map_err(|e| {
+        io_error_message(&format!("failed to run ffprobe on {}", path.display()), &e)
+    })?;
 
     if !output.status.success() {
         return Ok(None);
@@ -600,7 +741,9 @@ fn probe_bitrate(path: &Path) -> Result<Option<u32>, String> {
         "default=noprint_wrappers=1:nokey=1",
     ]);
     ffprobe.arg(path);
-    let output = ffprobe.output().map_err(|e| e.to_string())?;
+    let output = ffprobe.output().map_err(|e| {
+        io_error_message(&format!("failed to run ffprobe on {}", path.display()), &e)
+    })?;
 
     if !output.status.success() {
         return Ok(None);
@@ -735,7 +878,12 @@ fn run_sqlcipher(db_path: &Path, key: &str, sql: &str) -> Result<String, String>
             }
             child.wait_with_output()
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            io_error_message(
+                &format!("failed to run sqlcipher on {}", db_path.display()),
+                &e,
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -808,7 +956,7 @@ fn scan_rows(
     min_bit_depth: u32,
     include_sampler: bool,
 ) -> Result<Vec<ScanRow>, String> {
-    if !db_path.exists() {
+    if !path_exists(db_path)? {
         return Err(format!("database file not found: {}", db_path.display()));
     }
     if !command_available("sqlcipher") {
@@ -992,7 +1140,7 @@ fn fetch_content_files(
 }
 
 fn copy_file_with_parent_dirs(source: &Path, destination: &Path) -> Result<(), String> {
-    if !source.exists() {
+    if !path_exists(source)? {
         return Err(format!("source resource not found: {}", source.display()));
     }
     if source == destination {
@@ -1002,9 +1150,9 @@ fn copy_file_with_parent_dirs(source: &Path, destination: &Path) -> Result<(), S
         ));
     }
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        create_dir_all_path(parent)?;
     }
-    fs::copy(source, destination).map_err(|e| e.to_string())?;
+    copy_path(source, destination)?;
     Ok(())
 }
 
@@ -1017,7 +1165,7 @@ fn encode_anlz_path(file_name: &str) -> Vec<u8> {
 }
 
 fn rewrite_anlz_ppth(path: &Path, file_name: &str) -> Result<(), String> {
-    let mut bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let mut bytes = read_path(path)?;
     let Some(offset) = bytes.windows(4).position(|window| window == b"PPTH") else {
         return Ok(());
     };
@@ -1057,16 +1205,18 @@ fn rewrite_anlz_ppth(path: &Path, file_name: &str) -> Result<(), String> {
         bytes[8..12].copy_from_slice(&file_len.to_be_bytes());
     }
 
-    fs::write(path, bytes).map_err(|e| e.to_string())
+    write_path(path, bytes)
 }
 
 fn md5_hex(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut file = open_file_path(path)?;
     let mut context = md5::Context::new();
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
-        let bytes_read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        let bytes_read = retry_io_operation(format!("failed to read {}", path.display()), || {
+            file.read(&mut buffer)
+        })?;
         if bytes_read == 0 {
             break;
         }
@@ -1095,7 +1245,7 @@ fn xml_escape(value: &str) -> String {
 
 fn write_csv_export(path: &Path, tracks: &[Track]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        create_dir_all_path(parent)?;
     }
 
     let mut content = String::from(
@@ -1131,7 +1281,7 @@ fn write_csv_export(path: &Path, tracks: &[Track]) -> Result<(), String> {
         content.push('\n');
     }
 
-    fs::write(path, content).map_err(|e| e.to_string())
+    write_path(path, content)
 }
 
 fn excel_col_name(index: usize) -> String {
@@ -1160,7 +1310,7 @@ fn xlsx_cell(reference: &str, value: Option<&str>) -> String {
 
 fn write_xlsx_export(path: &Path, tracks: &[Track]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        create_dir_all_path(parent)?;
     }
 
     let headers = [
@@ -1233,7 +1383,7 @@ fn write_xlsx_export(path: &Path, tracks: &[Track]) -> Result<(), String> {
     let root_rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>";
     let content_types_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>";
 
-    let file = File::create(path).map_err(|e| e.to_string())?;
+    let file = create_file_path(path)?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("[Content_Types].xml", options)
@@ -1271,11 +1421,11 @@ fn validate_analysis_resources(
         };
 
         let source = PathBuf::from(source_path);
-        if !source.exists() {
+        if !path_exists(&source)? {
             return Err(format!("analysis resource missing: {}", source.display()));
         }
 
-        let metadata = fs::metadata(&source).map_err(|e| e.to_string())?;
+        let metadata = metadata_path(&source)?;
         let actual_size = metadata.len();
         if actual_size == 0 {
             return Err(format!("analysis resource is empty: {}", source.display()));
@@ -1327,14 +1477,19 @@ fn validate_analysis_resources(
 }
 
 fn collect_anlz_dat_paths(base: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
-    if !base.exists() {
+    if !path_exists(base)? {
         return Ok(());
     }
 
-    for entry in fs::read_dir(base).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
+    for entry in read_dir_path(base)? {
+        let entry = entry.map_err(|e| {
+            io_error_message(
+                &format!("failed to read directory entry in {}", base.display()),
+                &e,
+            )
+        })?;
         let path = entry.path();
-        if path.is_dir() {
+        if metadata_path(&path)?.is_dir() {
             collect_anlz_dat_paths(&path, paths)?;
             continue;
         }
@@ -1350,7 +1505,7 @@ fn collect_anlz_dat_paths(base: &Path, paths: &mut Vec<PathBuf>) -> Result<(), S
 fn cleanup_orphan_zero_analysis_dirs(db_path: &Path, key: &str) -> Result<CleanupReport, String> {
     let rekordbox_root = db_path.parent().unwrap_or_else(|| Path::new("."));
     let analysis_root = rekordbox_root.join("share/PIONEER/USBANLZ");
-    if !analysis_root.exists() {
+    if !path_exists(&analysis_root)? {
         return Ok(CleanupReport::default());
     }
 
@@ -1387,7 +1542,7 @@ fn cleanup_orphan_zero_analysis_dirs(db_path: &Path, key: &str) -> Result<Cleanu
         let candidates = [dat_path.clone(), ext_path, ex2_path];
         let existing_sizes: Vec<u64> = candidates
             .iter()
-            .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+            .filter_map(|path| metadata_path(path).ok().map(|meta| meta.len()))
             .collect();
 
         if !existing_sizes.is_empty() && existing_sizes.iter().all(|size| *size == 0) {
@@ -1400,7 +1555,7 @@ fn cleanup_orphan_zero_analysis_dirs(db_path: &Path, key: &str) -> Result<Cleanu
     }
 
     let archive_root = rekordbox_root.join(format!("anlz-orphan-cleanup-{}", timestamp_token()));
-    fs::create_dir_all(&archive_root).map_err(|e| e.to_string())?;
+    create_dir_all_path(&archive_root)?;
 
     for dir in &orphan_dirs {
         let relative = dir
@@ -1408,9 +1563,9 @@ fn cleanup_orphan_zero_analysis_dirs(db_path: &Path, key: &str) -> Result<Cleanu
             .map_err(|e| e.to_string())?;
         let target = archive_root.join(relative);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            create_dir_all_path(parent)?;
         }
-        fs::rename(dir, &target).map_err(|e| e.to_string())?;
+        rename_path(dir, &target)?;
     }
 
     Ok(CleanupReport {
@@ -1478,6 +1633,17 @@ fn check_database_readable(db_path: &Path, key: &str) -> bool {
     }
 
     run_sqlcipher(db_path, key, "SELECT COUNT(*) FROM djmdContent LIMIT 1;").is_ok()
+}
+
+fn ensure_database_writable(db_path: &Path, key: &str) -> Result<(), String> {
+    run_sqlcipher(db_path, key, "BEGIN IMMEDIATE;\nROLLBACK;")
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "database is not writable before conversion: {}. Close Rekordbox and any backup/sync tools that may be using master.db, then try again.",
+                error
+            )
+        })
 }
 
 fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
@@ -1548,9 +1714,9 @@ fn backup_file_tree(source: &Path, backup_root: &Path) -> Result<PathBuf, String
     let relative = backup_relative_path(source);
     let target = backup_root.join(relative);
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        create_dir_all_path(parent)?;
     }
-    fs::copy(source, &target).map_err(|e| e.to_string())?;
+    copy_path(source, &target)?;
     Ok(target)
 }
 
@@ -1582,7 +1748,7 @@ fn build_source_archive_path(source: &Path, bitrate_kbps: u32) -> Result<PathBuf
     } else {
         parent.join(format!("{stem}-{bitrate_kbps}kbps.{extension}"))
     };
-    if candidate.exists() {
+    if path_exists(&candidate)? {
         return Err(format!(
             "source archive already exists, refusing to overwrite: {}",
             candidate.display()
@@ -1597,7 +1763,7 @@ fn convert_one_track(
     backup_root: &Path,
 ) -> Result<(Track, PathBuf, PathBuf), String> {
     let source = Path::new(&track.full_path);
-    if !source.exists() {
+    if !path_exists(source)? {
         return Err(format!("source file not found: {}", source.display()));
     }
 
@@ -1609,7 +1775,7 @@ fn convert_one_track(
 
     backup_file_tree(source, backup_root)?;
 
-    fs::rename(source, &archive_path).map_err(|e| e.to_string())?;
+    rename_path(source, &archive_path)?;
 
     let output_parent = output_path
         .parent()
@@ -1618,7 +1784,15 @@ fn convert_one_track(
         .prefix(".rkb-lossless-")
         .suffix(&format!(".{}", spec.extension))
         .tempfile_in(output_parent)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            io_error_message(
+                &format!(
+                    "failed to create temporary output file in {}",
+                    output_parent.display()
+                ),
+                &e,
+            )
+        })?;
     let temp_output_path = temp_output.path().to_path_buf();
     drop(temp_output);
 
@@ -1638,35 +1812,50 @@ fn convert_one_track(
         }
         ffmpeg.arg(&temp_output_path);
 
-        let output = ffmpeg.output().map_err(|e| e.to_string())?;
+        let output = ffmpeg.output().map_err(|e| {
+            io_error_message(
+                &format!(
+                    "failed to run ffmpeg while converting {} -> {}",
+                    archive_path.display(),
+                    temp_output_path.display()
+                ),
+                &e,
+            )
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return Err(if !stderr.is_empty() { stderr } else { stdout });
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(format!(
+                "ffmpeg failed while converting {} -> {}: {}",
+                archive_path.display(),
+                temp_output_path.display(),
+                detail
+            ));
         }
 
         Ok(())
     })();
 
     if let Err(error) = conversion_result {
-        let _ = fs::remove_file(&temp_output_path);
-        let _ = fs::rename(&archive_path, source);
+        let _ = remove_file_path(&temp_output_path);
+        let _ = rename_path(&archive_path, source);
         return Err(error);
     }
 
-    if output_path.exists() {
-        let _ = fs::remove_file(&temp_output_path);
-        let _ = fs::rename(&archive_path, source);
+    if path_exists(&output_path)? {
+        let _ = remove_file_path(&temp_output_path);
+        let _ = rename_path(&archive_path, source);
         return Err(format!(
             "target file already exists: {}",
             output_path.display()
         ));
     }
 
-    if let Err(error) = fs::rename(&temp_output_path, &output_path) {
-        let _ = fs::remove_file(&temp_output_path);
-        let _ = fs::rename(&archive_path, source);
-        return Err(error.to_string());
+    if let Err(error) = rename_path(&temp_output_path, &output_path) {
+        let _ = remove_file_path(&temp_output_path);
+        let _ = rename_path(&archive_path, source);
+        return Err(error);
     }
 
     let channels = probe_channels(&archive_path)?;
@@ -1730,7 +1919,7 @@ fn migrate_tracks_in_db(
                 .to_string_lossy()
                 .to_string();
             let folder_path = output_path.to_string_lossy().to_string();
-            let file_size = fs::metadata(output_path).map_err(|e| e.to_string())?.len();
+            let file_size = metadata_path(output_path)?.len();
             let old_uuid = sqlcipher_required_value(
                 db_path,
                 key,
@@ -1779,7 +1968,7 @@ fn migrate_tracks_in_db(
                         copy_file_with_parent_dirs(&file.source, &destination)?;
                         rewrite_anlz_ppth(&destination, &file_name)?;
                         copied_resources.push(destination.clone());
-                        let size = fs::metadata(&destination).map_err(|e| e.to_string())?.len();
+                        let size = metadata_path(&destination)?.len();
                         let hash = md5_hex(&destination)?;
                         let new_path =
                             rewrite_uuid_in_path(&file.original.path, &old_uuid, &content_uuid);
@@ -2007,7 +2196,7 @@ fn migrate_tracks_in_db(
 
     if result.is_err() {
         for path in copied_resources {
-            let _ = fs::remove_file(path);
+            let _ = remove_file_path(&path);
         }
     }
 
@@ -2032,7 +2221,7 @@ where
     let spec = preset_spec(&req.preset)?;
     let source_handling = source_handling_mode(&req.source_handling)?;
     let db_path = PathBuf::from(&req.db_path);
-    if !db_path.exists() {
+    if !path_exists(&db_path)? {
         return Err(format!("database file not found: {}", db_path.display()));
     }
 
@@ -2041,16 +2230,17 @@ where
             "ffmpeg was built without Apple's aac_at encoder, so M4A 320kbps is unavailable".into(),
         );
     }
+    ensure_database_writable(&db_path, DEFAULT_KEY)?;
 
     let timestamp = timestamp_token();
     let backup_root = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(format!("rkb-lossless-backup-{timestamp}"));
-    fs::create_dir_all(&backup_root).map_err(|e| e.to_string())?;
+    create_dir_all_path(&backup_root)?;
 
     let db_backup = backup_root.join("master.db");
-    fs::copy(&db_path, &db_backup).map_err(|e| e.to_string())?;
+    copy_path(&db_path, &db_backup)?;
 
     let music_backup_root = backup_root.join("music");
     let mut converted_tracks: Vec<Track> = Vec::with_capacity(req.tracks.len());
@@ -2081,7 +2271,7 @@ where
             }
             Err(error) => {
                 for path in output_paths {
-                    let _ = fs::remove_file(path);
+                    let _ = remove_file_path(&path);
                 }
                 for archive_path in archive_paths {
                     let source_path = req
@@ -2105,7 +2295,7 @@ where
                         })
                         .map(|candidate| PathBuf::from(&candidate.full_path))
                         .unwrap_or_else(|| archive_path.clone());
-                    let _ = fs::rename(archive_path, source_path);
+                    let _ = rename_path(&archive_path, &source_path);
                 }
                 return Err(error);
             }
@@ -2124,11 +2314,11 @@ where
             Ok(tracks) => tracks,
             Err(error) => {
                 for output_path in &output_paths {
-                    let _ = fs::remove_file(output_path);
+                    let _ = remove_file_path(output_path);
                 }
                 for (track, archive_path) in req.tracks.iter().zip(archive_paths.iter()) {
                     let source_path = PathBuf::from(&track.full_path);
-                    let _ = fs::rename(archive_path, source_path);
+                    let _ = rename_path(archive_path, &source_path);
                 }
                 return Err(error);
             }
@@ -2195,7 +2385,7 @@ where
         DEFAULT_KEY,
         req.min_bit_depth,
         req.include_sampler,
-        |payload| on_progress(payload),
+        &mut on_progress,
     )?;
     let tracks = outcome.tracks;
     let flac = tracks
@@ -2321,10 +2511,10 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
         if status.success() {
             return Ok(());
         }
-        return Err(format!(
+        Err(format!(
             "failed to open path in the file manager: {}",
             path.display()
-        ));
+        ))
     }
 
     #[cfg(target_os = "windows")]
@@ -2463,12 +2653,15 @@ mod tests {
             .or_else(|| scan.tracks.first().cloned())
             .expect("expected at least one convertible track");
 
-        let result = convert_impl(ConvertRequest {
-            db_path: db_path.clone(),
-            preset: "mp3-320".to_string(),
-            source_handling: "rename".to_string(),
-            tracks: vec![track.clone()],
-        })
+        let result = convert_impl_with_progress(
+            ConvertRequest {
+                db_path: db_path.clone(),
+                preset: "mp3-320".to_string(),
+                source_handling: "rename".to_string(),
+                tracks: vec![track.clone()],
+            },
+            |_| {},
+        )
         .expect("conversion and migration should succeed");
 
         assert_eq!(result.converted_count, 1);
