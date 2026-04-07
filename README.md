@@ -129,7 +129,7 @@ npm run tauri build -- --target x86_64-apple-darwin --bundles app
 - 如果 `src-tauri/bin` 里已经有 `ffmpeg-x86_64-pc-windows-msvc.exe` / `sqlcipher-x86_64-pc-windows-msvc.exe`，它们会被自动收进安装包，并嵌入便携版主程序
 - 如果这些 Windows sidecar 还没放进去，构建也不会失败；应用运行时会继续按环境变量和系统 `PATH` 查找依赖
 - 因为大多数 Windows `ffmpeg` 不带 Apple 的 `aac_at` 编码器，`M4A 320kbps` 在 Windows 上通常不可用，预检里会直接提示
-- 便携版不会安装 WebView2；少数没有 WebView2 Runtime 的机器需要先安装 Microsoft WebView2 Runtime，或改用安装包方案
+- 便携版启动前会检测 Microsoft Edge WebView2 Runtime；如果缺失，会下载 Microsoft Evergreen Bootstrapper 并静默安装后再继续打开应用。这个自动安装步骤需要联网，少数受企业策略限制的机器可能仍需要管理员手动安装 WebView2 Runtime
 - macOS 上如果 sidecar 来自 Homebrew 之类的动态链接构建，构建脚本会把它依赖的非系统 `.dylib` 一起收进 app 资源并改写加载路径，避免生成“只在开发机可运行”的假分发包
 
 仓库还附带了一个 sidecar 下载脚本 [tools/fetch-windows-sidecars.ps1](/Users/chuanpeng/Documents/rkb-lossless-process/tools/fetch-windows-sidecars.ps1)：

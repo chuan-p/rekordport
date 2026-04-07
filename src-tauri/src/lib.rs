@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -17,6 +19,12 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const DEFAULT_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const WEBVIEW2_BOOTSTRAPPER_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+#[cfg(any(target_os = "windows", test))]
+const WEBVIEW2_CLIENT_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
 
 #[derive(Debug, Deserialize)]
 struct ScanRequest {
@@ -216,6 +224,188 @@ static COMMAND_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static COMMAND_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
 static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static AUDIO_PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, AudioProbe>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn hidden_windows_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn webview2_runtime_installed() -> bool {
+    let registry_keys = [
+        format!(r"HKCU\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}"),
+        format!(r"HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}"),
+        format!(r"HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}"),
+    ];
+
+    registry_keys.iter().any(|key| {
+        let output = hidden_windows_command("reg")
+            .args(["query", key, "/v", "pv"])
+            .output();
+
+        output
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+                } else {
+                    None
+                }
+            })
+            .and_then(|stdout| parse_webview2_registry_version(&stdout))
+            .is_some()
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_webview2_runtime(timeout: Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if webview2_runtime_installed() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    webview2_runtime_installed()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_webview2_registry_version(reg_query_stdout: &str) -> Option<String> {
+    reg_query_stdout.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let name = parts.next()?;
+        if !name.eq_ignore_ascii_case("pv") {
+            return None;
+        }
+
+        let kind = parts.next()?;
+        if !kind.eq_ignore_ascii_case("REG_SZ") {
+            return None;
+        }
+
+        let version = parts.next()?.trim();
+        if version.is_empty() || version == "0.0.0.0" {
+            None
+        } else {
+            Some(version.to_string())
+        }
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn webview2_bootstrapper_path() -> PathBuf {
+    env::temp_dir()
+        .join("rekordport-webview2")
+        .join("MicrosoftEdgeWebview2Setup.exe")
+}
+
+#[cfg(target_os = "windows")]
+fn download_webview2_bootstrapper(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create WebView2 bootstrapper directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let output = hidden_windows_command("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!(
+                "$ErrorActionPreference = 'Stop'; \
+                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+                 Invoke-WebRequest -UseBasicParsing -Uri '{}' -OutFile '{}'",
+                WEBVIEW2_BOOTSTRAPPER_URL,
+                path.display().to_string().replace('\'', "''")
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("failed to start PowerShell to download WebView2 Runtime: {e}"))?;
+
+    if output.status.success() && path.exists() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err("PowerShell did not download the WebView2 Runtime bootstrapper".to_string())
+    } else {
+        Err(format!(
+            "PowerShell failed to download the WebView2 Runtime bootstrapper: {stderr}"
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_webview2_runtime() -> Result<(), String> {
+    let bootstrapper = webview2_bootstrapper_path();
+    download_webview2_bootstrapper(&bootstrapper)?;
+
+    let status = hidden_windows_command(&bootstrapper)
+        .args(["/silent", "/install"])
+        .status()
+        .map_err(|e| format!("failed to start WebView2 Runtime installer: {e}"))?;
+
+    if status.success() || wait_for_webview2_runtime(Duration::from_secs(10)) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "WebView2 Runtime installer exited with status: {status}"
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn show_webview2_installing_dialog() {
+    let _ = rfd::MessageDialog::new()
+        .set_title("Installing WebView2 Runtime")
+        .set_description(
+            "Rekordport needs Microsoft Edge WebView2 Runtime to open its window.\n\n\
+             It is missing on this PC, so Rekordport will download Microsoft's Evergreen Bootstrapper and install it silently now. \
+             Please keep this window open; the app will continue after installation.",
+        )
+        .set_buttons(rfd::MessageButtons::Ok)
+        .set_level(rfd::MessageLevel::Info)
+        .show();
+}
+
+#[cfg(target_os = "windows")]
+fn show_webview2_install_failed_dialog(error: &str) {
+    let _ = rfd::MessageDialog::new()
+        .set_title("WebView2 Runtime is required")
+        .set_description(format!(
+            "Rekordport could not install Microsoft Edge WebView2 Runtime automatically.\n\n\
+             Error: {error}\n\n\
+             Please install WebView2 Runtime from Microsoft and open Rekordport again:\n\
+             https://developer.microsoft.com/microsoft-edge/webview2/"
+        ))
+        .set_buttons(rfd::MessageButtons::Ok)
+        .set_level(rfd::MessageLevel::Error)
+        .show();
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_webview2_runtime_before_launch() -> Result<(), String> {
+    if webview2_runtime_installed() {
+        return Ok(());
+    }
+
+    show_webview2_installing_dialog();
+    install_webview2_runtime()?;
+
+    if wait_for_webview2_runtime(Duration::from_secs(10)) {
+        Ok(())
+    } else {
+        Err("WebView2 Runtime installation finished, but the runtime was still not detected in the registry".to_string())
+    }
+}
 
 fn command_exists(command: &str) -> bool {
     Command::new(command).arg("--version").output().is_ok()
@@ -2693,6 +2883,12 @@ async fn preflight_check(req: PreflightRequest) -> Result<PreflightResponse, Str
 }
 
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    if let Err(error) = ensure_webview2_runtime_before_launch() {
+        show_webview2_install_failed_dialog(&error);
+        return;
+    }
+
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             default_database_path,
@@ -2712,6 +2908,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_webview2_runtime_registry_version() {
+        let output = format!(
+            r#"
+HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
+    pv    REG_SZ    146.0.3856.109
+"#
+        );
+
+        assert_eq!(
+            parse_webview2_registry_version(&output),
+            Some("146.0.3856.109".to_string())
+        );
+        assert_eq!(
+            parse_webview2_registry_version("    pv    REG_SZ    0.0.0.0"),
+            None
+        );
+        assert_eq!(parse_webview2_registry_version(""), None);
+    }
 
     #[test]
     fn parses_ffmpeg_stereo_probe() {
