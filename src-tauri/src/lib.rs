@@ -2665,6 +2665,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_ffmpeg_stereo_probe() {
+        let probe = parse_ffmpeg_audio_probe(
+            "Input #0, flac, from 'song.flac':\n  Duration: 00:03:00.00, bitrate: 2847 kb/s\n  Stream #0:0: Audio: flac, 96000 Hz, stereo, s24, 2847 kb/s",
+        );
+
+        assert_eq!(probe.sample_rate, Some(96_000));
+        assert_eq!(probe.channels, Some(2));
+        assert_eq!(probe.bitrate_kbps, Some(2847));
+    }
+
+    #[test]
+    fn parses_ffmpeg_mono_and_surround_probe() {
+        let mono = parse_ffmpeg_audio_probe(
+            "Stream #0:0: Audio: pcm_s16le, 44100 Hz, mono, s16, 705 kb/s",
+        );
+        let surround = parse_ffmpeg_audio_probe(
+            "Stream #0:0: Audio: alac, 48000 Hz, 5.1(side), s24p, 6912 kb/s",
+        );
+
+        assert_eq!(mono.channels, Some(1));
+        assert_eq!(surround.channels, Some(6));
+    }
+
+    #[test]
+    fn parses_container_bitrate_when_stream_bitrate_is_missing() {
+        let probe = parse_ffmpeg_audio_probe(
+            "Input #0, wav, from 'song.wav':\n  Duration: 00:01:00.00, bitrate: 1411 kb/s\n  Stream #0:0: Audio: pcm_s16le, 44100 Hz, stereo, s16",
+        );
+
+        assert_eq!(probe.sample_rate, Some(44_100));
+        assert_eq!(probe.channels, Some(2));
+        assert_eq!(probe.bitrate_kbps, Some(1411));
+    }
+
+    #[test]
     #[ignore]
     fn migrate_real_master_db_track() {
         let db_path = "/Users/chuanpeng/Library/Pioneer/rekordbox/master.db".to_string();
