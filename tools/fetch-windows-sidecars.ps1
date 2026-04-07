@@ -73,17 +73,12 @@ Assert-OptionalSha256 $ffmpegZip $env:RKB_FFMPEG_WINDOWS_SHA256 "ffmpeg archive"
 Expand-Archive -LiteralPath $ffmpegZip -DestinationPath $ffmpegExtractDir -Force
 
 $ffmpegExe = Get-ChildItem -Path $ffmpegExtractDir -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
-$ffprobeExe = Get-ChildItem -Path $ffmpegExtractDir -Filter "ffprobe.exe" -Recurse | Select-Object -First 1
 
 if (-not $ffmpegExe) {
   throw "ffmpeg.exe was not found in $ffmpegUrl"
 }
-if (-not $ffprobeExe) {
-  throw "ffprobe.exe was not found in $ffmpegUrl"
-}
 
 Copy-RequiredTool $ffmpegExe.FullName "ffmpeg-$targetTriple.exe"
-Copy-RequiredTool $ffprobeExe.FullName "ffprobe-$targetTriple.exe"
 
 if ([string]::IsNullOrWhiteSpace($sqlcipherUrl)) {
   throw "No default sqlcipher download is configured for $targetTriple. Set RKB_SQLCIPHER_WINDOWS_URL or place sqlcipher-$targetTriple.exe in src-tauri/bin."

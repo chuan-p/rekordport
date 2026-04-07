@@ -77,13 +77,13 @@
     "targets": "all",
     "windows": {
       "webviewInstallMode": {
-        "type": "offlineInstaller"
+        "type": "downloadBootstrapper",
+        "silent": true
       }
     },
     "externalBin": [
       "bin/sqlcipher",
-      "bin/ffmpeg",
-      "bin/ffprobe"
+      "bin/ffmpeg"
     ],
     "icon": [
       "icons/32x32.png",

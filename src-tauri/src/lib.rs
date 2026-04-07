@@ -132,10 +132,8 @@ struct PreflightResponse {
     os: String,
     sqlcipher_available: bool,
     ffmpeg_available: bool,
-    ffprobe_available: bool,
     sqlcipher_source: Option<String>,
     ffmpeg_source: Option<String>,
-    ffprobe_source: Option<String>,
     m4a_encoder_available: bool,
     db_path: String,
     db_exists: bool,
@@ -207,9 +205,17 @@ enum SourceHandling {
     Trash,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AudioProbe {
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    bitrate_kbps: Option<u32>,
+}
+
 static COMMAND_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static COMMAND_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
 static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+static AUDIO_PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, AudioProbe>>> = OnceLock::new();
 
 fn command_exists(command: &str) -> bool {
     Command::new(command).arg("--version").output().is_ok()
@@ -246,7 +252,6 @@ fn tool_override_var(command: &str) -> Option<&'static str> {
     match command {
         "sqlcipher" => Some("RKB_SQLCIPHER_PATH"),
         "ffmpeg" => Some("RKB_FFMPEG_PATH"),
-        "ffprobe" => Some("RKB_FFPROBE_PATH"),
         _ => None,
     }
 }
@@ -664,97 +669,129 @@ fn ffmpeg_has_encoder(name: &str) -> Result<bool, String> {
     Ok(available)
 }
 
-fn probe_channels(path: &Path) -> Result<u32, String> {
-    if !command_available("ffprobe") {
-        return Ok(2);
+fn parse_number_before_marker(text: &str, marker: &str) -> Option<u32> {
+    for (marker_index, _) in text.match_indices(marker) {
+        let bytes = text.as_bytes();
+        let mut end = marker_index;
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+
+        let mut start = end;
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+
+        if start < end {
+            if let Ok(value) = text[start..end].parse::<u32>() {
+                return Some(value);
+            }
+        }
     }
 
-    let mut ffprobe = prepared_command("ffprobe")?;
-    ffprobe.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=channels",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-    ]);
-    ffprobe.arg(path);
-    let output = ffprobe.output().map_err(|e| {
-        io_error_message(&format!("failed to run ffprobe on {}", path.display()), &e)
+    None
+}
+
+fn parse_number_after_marker(text: &str, marker: &str) -> Option<u32> {
+    let (marker_index, _) = text.match_indices(marker).next()?;
+    let bytes = text.as_bytes();
+    let mut start = marker_index + marker.len();
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+
+    if start < end {
+        text[start..end].parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
+fn parse_audio_channels(text: &str) -> Option<u32> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(value) = parse_number_before_marker(&lower, " channels") {
+        return Some(value);
+    }
+
+    for (needle, channels) in [
+        ("7.1", 8),
+        ("6.1", 7),
+        ("5.1", 6),
+        ("5.0", 5),
+        ("4.0", 4),
+        ("stereo", 2),
+        ("mono", 1),
+    ] {
+        if lower.contains(needle) {
+            return Some(channels);
+        }
+    }
+
+    None
+}
+
+fn parse_ffmpeg_audio_probe(text: &str) -> AudioProbe {
+    let audio_line = text.lines().find(|line| line.contains("Audio:"));
+    let probe_text = audio_line.unwrap_or(text);
+    AudioProbe {
+        sample_rate: parse_number_before_marker(probe_text, " Hz"),
+        channels: audio_line.and_then(parse_audio_channels),
+        bitrate_kbps: parse_number_before_marker(probe_text, " kb/s")
+            .or_else(|| parse_number_after_marker(text, "bitrate:")),
+    }
+}
+
+fn probe_audio(path: &Path) -> Result<AudioProbe, String> {
+    if !command_available("ffmpeg") {
+        return Ok(AudioProbe::default());
+    }
+
+    let cache_key = path.to_path_buf();
+    let cache = AUDIO_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().expect("audio probe cache lock poisoned");
+        if let Some(value) = guard.get(&cache_key) {
+            return Ok(value.clone());
+        }
+    }
+
+    let mut ffmpeg = prepared_command("ffmpeg")?;
+    ffmpeg.args(["-hide_banner", "-i"]);
+    ffmpeg.arg(path);
+    let output = ffmpeg.output().map_err(|e| {
+        io_error_message(
+            &format!("failed to run ffmpeg probe on {}", path.display()),
+            &e,
+        )
     })?;
 
-    if !output.status.success() {
-        return Ok(2);
-    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let probe = parse_ffmpeg_audio_probe(&text);
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(stdout.parse::<u32>().unwrap_or(2))
+    let mut guard = cache.lock().expect("audio probe cache lock poisoned");
+    guard.insert(cache_key, probe.clone());
+    Ok(probe)
+}
+
+fn probe_channels(path: &Path) -> Result<u32, String> {
+    Ok(probe_audio(path)?.channels.unwrap_or(2))
 }
 
 fn probe_sample_rate(path: &Path) -> Result<Option<u32>, String> {
-    if !command_available("ffprobe") {
-        return Ok(None);
-    }
-
-    let mut ffprobe = prepared_command("ffprobe")?;
-    ffprobe.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=sample_rate",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-    ]);
-    ffprobe.arg(path);
-    let output = ffprobe.output().map_err(|e| {
-        io_error_message(&format!("failed to run ffprobe on {}", path.display()), &e)
-    })?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(stdout.parse::<u32>().ok())
+    Ok(probe_audio(path)?.sample_rate)
 }
 
 fn probe_bitrate(path: &Path) -> Result<Option<u32>, String> {
-    if !command_available("ffprobe") {
-        return Ok(None);
-    }
-
-    let mut ffprobe = prepared_command("ffprobe")?;
-    ffprobe.args([
-        "-v",
-        "error",
-        "-show_entries",
-        "format=bit_rate",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-    ]);
-    ffprobe.arg(path);
-    let output = ffprobe.output().map_err(|e| {
-        io_error_message(&format!("failed to run ffprobe on {}", path.display()), &e)
-    })?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(stdout.parse::<u32>().ok().map(|value| value / 1000))
+    Ok(probe_audio(path)?.bitrate_kbps)
 }
 
 fn target_sample_rate_for_source(sample_rate: Option<u32>) -> u32 {
@@ -1655,10 +1692,8 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     let db_path_buf = PathBuf::from(&db_path);
     let sqlcipher_available = command_available("sqlcipher");
     let ffmpeg_available = command_available("ffmpeg");
-    let ffprobe_available = command_available("ffprobe");
     let sqlcipher_source = command_source("sqlcipher");
     let ffmpeg_source = command_source("ffmpeg");
-    let ffprobe_source = command_source("ffprobe");
     let m4a_encoder_available = ffmpeg_has_encoder("aac_at").unwrap_or(false);
     let db_exists = !db_path.is_empty() && db_path_buf.exists();
     let db_readable = if db_exists {
@@ -1673,9 +1708,6 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     }
     if !ffmpeg_available {
         warnings.push("ffmpeg was not found, so format conversion is unavailable. Add a bundled sidecar in src-tauri/bin or install it in the system PATH.".to_string());
-    }
-    if !ffprobe_available {
-        warnings.push("ffprobe was not found, so some audio probing during conversion may be less accurate. Add a bundled sidecar in src-tauri/bin or install it in the system PATH.".to_string());
     }
     if !db_path.is_empty() && !db_exists {
         warnings.push(format!("Database path does not exist: {db_path}"));
@@ -1696,10 +1728,8 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
         os: platform_name(),
         sqlcipher_available,
         ffmpeg_available,
-        ffprobe_available,
         sqlcipher_source,
         ffmpeg_source,
-        ffprobe_source,
         m4a_encoder_available,
         db_path,
         db_exists,

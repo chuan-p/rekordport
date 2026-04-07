@@ -103,7 +103,7 @@ function ensureWindowsSidecars(targetTriple) {
   if (process.platform !== "win32") return;
   if (!shouldAutoFetchWindowsSidecars()) return;
 
-  const commands = ["sqlcipher", "ffmpeg", "ffprobe"];
+  const commands = ["sqlcipher", "ffmpeg"];
   const missing = commands.filter((command) => {
     const sourcePath = path.join(tauriDir, "bin", sidecarFilename(command, targetTriple));
     return !existsSync(sourcePath);

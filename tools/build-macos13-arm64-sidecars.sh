@@ -106,14 +106,12 @@ cp -R "${FFMPEG_SRC}" "${FFMPEG_BUILD}"
       --extra-cflags="-arch arm64 -mmacosx-version-min=${DEPLOYMENT_TARGET} -I${LAME_INSTALL}/include" \
       --extra-ldflags="-arch arm64 -mmacosx-version-min=${DEPLOYMENT_TARGET} -L${LAME_INSTALL}/lib" \
       --extra-libs="-lm"
-  make -j"${MAKE_JOBS}" ffmpeg ffprobe
+  make -j"${MAKE_JOBS}" ffmpeg
 )
 
 install -m 0755 "${SQLCIPHER_BUILD}/sqlite3" "${OUT_DIR}/sqlcipher-aarch64-apple-darwin"
 install -m 0755 "${FFMPEG_BUILD}/ffmpeg" "${OUT_DIR}/ffmpeg-aarch64-apple-darwin"
-install -m 0755 "${FFMPEG_BUILD}/ffprobe" "${OUT_DIR}/ffprobe-aarch64-apple-darwin"
 
 echo "[sidecars] installed:"
 echo "  ${OUT_DIR}/sqlcipher-aarch64-apple-darwin"
 echo "  ${OUT_DIR}/ffmpeg-aarch64-apple-darwin"
-echo "  ${OUT_DIR}/ffprobe-aarch64-apple-darwin"

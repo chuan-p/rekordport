@@ -245,7 +245,6 @@ function dependencySourceSummary() {
   const sources = [
     state.preflight.sqlcipher_source,
     state.preflight.ffmpeg_source,
-    state.preflight.ffprobe_source,
   ].filter(Boolean);
   if (!sources.length) return "";
   const bundledCount = sources.filter((source) => String(source).startsWith("bundled sidecar")).length;

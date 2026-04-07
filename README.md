@@ -22,7 +22,7 @@ npm install
 Tauri 桌面壳还需要这些依赖来源之一：
 
 - Rust toolchain
-- 系统 PATH 里的 `sqlcipher` / `ffmpeg` / `ffprobe`
+- 系统 PATH 里的 `sqlcipher` / `ffmpeg`
 - 或放在 `src-tauri/bin` 里的 sidecar 二进制
 
 `npm run tauri dev` 会在这套工具链齐备时启动。
@@ -76,7 +76,6 @@ python3 rekordbox_lossless_scan.py --format table
 1. 环境变量覆盖
    - `RKB_SQLCIPHER_PATH`
    - `RKB_FFMPEG_PATH`
-   - `RKB_FFPROBE_PATH`
 2. `src-tauri/bin` 或打包后的 app 资源目录
 3. 系统 PATH
 
@@ -93,17 +92,15 @@ macOS 打包前还会额外做这一步：
 tools/build-macos13-arm64-sidecars.sh
 ```
 
-这会重新编出一套 `macOS 13` 可用的 `sqlcipher` / `ffmpeg` / `ffprobe`，并覆盖到 `src-tauri/bin/`。
+这会重新编出一套 `macOS 13` 可用的 `sqlcipher` / `ffmpeg`，并覆盖到 `src-tauri/bin/`。
 
 这意味着像 `sqlcipher -> /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib` 这种链路，现在会在构建期被内置进 app，而不是留给用户机器去碰运气。
 
 常见文件名示例：
 
 - `src-tauri/bin/ffmpeg-aarch64-apple-darwin`
-- `src-tauri/bin/ffprobe-aarch64-apple-darwin`
 - `src-tauri/bin/sqlcipher-aarch64-apple-darwin`
 - `src-tauri/bin/ffmpeg-x86_64-pc-windows-msvc.exe`
-- `src-tauri/bin/ffprobe-x86_64-pc-windows-msvc.exe`
 - `src-tauri/bin/sqlcipher-x86_64-pc-windows-msvc.exe`
 
 ## Windows 构建
@@ -129,21 +126,22 @@ npm run tauri build -- --target x86_64-apple-darwin --bundles app
 
 构建时现在会自动只打包“当前目标平台实际存在”的 sidecar，并且先生成当前目标平台的可分发副本：
 
-- 如果 `src-tauri/bin` 里已经有 `ffmpeg-x86_64-pc-windows-msvc.exe` / `ffprobe-x86_64-pc-windows-msvc.exe` / `sqlcipher-x86_64-pc-windows-msvc.exe`，它们会被自动收进安装包
+- 如果 `src-tauri/bin` 里已经有 `ffmpeg-x86_64-pc-windows-msvc.exe` / `sqlcipher-x86_64-pc-windows-msvc.exe`，它们会被自动收进安装包
 - 如果这些 Windows sidecar 还没放进去，构建也不会失败；应用运行时会继续按环境变量和系统 `PATH` 查找依赖
 - 因为大多数 Windows `ffmpeg` 不带 Apple 的 `aac_at` 编码器，`M4A 320kbps` 在 Windows 上通常不可用，预检里会直接提示
+- Windows 安装包使用 WebView2 在线 bootstrapper，避免内置离线安装器带来的约 127MB 体积；少数没有 WebView2 的机器首次安装需要联网
 - macOS 上如果 sidecar 来自 Homebrew 之类的动态链接构建，构建脚本会把它依赖的非系统 `.dylib` 一起收进 app 资源并改写加载路径，避免生成“只在开发机可运行”的假分发包
 
 仓库还附带了一个 sidecar 下载脚本 [tools/fetch-windows-sidecars.ps1](/Users/chuanpeng/Documents/rkb-lossless-process/tools/fetch-windows-sidecars.ps1)：
 
-- 默认下载 `BtbN/FFmpeg-Builds` 的 `win64-lgpl` 包，提取 `ffmpeg.exe` 和 `ffprobe.exe`
+- 默认下载 `BtbN/FFmpeg-Builds` 的 `win64-lgpl` 包，提取 `ffmpeg.exe`
 - 默认下载 `Katecca/sqlcipher-static-binary` 提供的 `sqlcipher.exe`
 - 可以用 `RKB_FFMPEG_WINDOWS_URL` 和 `RKB_SQLCIPHER_WINDOWS_URL` 覆盖下载地址
 - 如果你想锁定供应链校验，还可以额外设置 `RKB_FFMPEG_WINDOWS_SHA256` 和 `RKB_SQLCIPHER_WINDOWS_SHA256`
 
 注意：
 
-- `ffmpeg/ffprobe` 默认来源是 BtbN 的公开构建
+- `ffmpeg` 默认来源是 BtbN 的公开构建
 - `sqlcipher.exe` 默认来源是社区维护的预编译二进制，不是 SQLCipher 官方公开发布的 Windows CLI；如果你有更可信的内部制品库或自建构建产物，建议用 `RKB_SQLCIPHER_WINDOWS_URL` 覆盖
 
 ## macOS 正式签名与发布
@@ -219,4 +217,4 @@ python3 rekordbox_lossless_scan.py --include-sampler
 python3 rekordbox_lossless_scan.py --min-bit-depth 24
 ```
 
-扫描器现在直接按 Rekordbox 数据库里的 `FileType=6` 识别 ALAC，不再依赖 `ffprobe` 做扫描阶段的 codec 探测；`ffprobe` 仍会在部分转换音频探测里使用。
+扫描器现在直接按 Rekordbox 数据库里的 `FileType=6` 识别 ALAC；转换阶段的音频探测复用已打包的 `ffmpeg`，不再额外依赖 `ffprobe`。
