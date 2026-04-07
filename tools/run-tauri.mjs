@@ -9,6 +9,7 @@ const repoRoot = path.resolve(__dirname, "..");
 const tauriDir = path.join(repoRoot, "src-tauri");
 const tauriTargetDir = path.join(tauriDir, "target");
 const args = process.argv.slice(2);
+const command = args[0];
 
 function parseBooleanEnv(name, env = process.env) {
   const value = env[name];
@@ -117,6 +118,7 @@ const targetTriple = extractTargetTriple(args);
 const childEnv = {
   ...process.env,
   ...(targetTriple ? { RKB_TARGET_TRIPLE: targetTriple } : {}),
+  ...(command === "build" ? { RKB_REQUIRE_TARGET_SIDECARS: "true" } : {}),
 };
 
 const prepare = spawnSync(process.execPath, [path.join(repoRoot, "tools", "prepare-tauri-config.mjs")], {
@@ -131,7 +133,6 @@ if (prepare.status !== 0) {
 
 cleanStaleSidecarDirs();
 
-const command = args[0];
 const rest = args.slice(1);
 const tauriArgs = command
   ? [command, "--config", "src-tauri/tauri.generated.conf.json", ...rest]

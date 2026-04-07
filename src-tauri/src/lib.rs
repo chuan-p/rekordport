@@ -66,9 +66,15 @@ struct PreflightRequest {
 
 #[derive(Debug, Serialize)]
 struct ScanSummary {
+    library_total: usize,
+    candidate_total: usize,
     total: usize,
     flac: usize,
+    alac: usize,
     hi_res: usize,
+    m4a_candidates: usize,
+    unreadable_m4a: usize,
+    non_alac_m4a: usize,
     sampler_included: bool,
     min_bit_depth: u32,
     db_path: String,
@@ -180,6 +186,20 @@ struct ScanRow {
     full_path: String,
 }
 
+#[derive(Debug, Default)]
+struct ScanStats {
+    candidate_total: usize,
+    m4a_candidates: usize,
+    unreadable_m4a: usize,
+    non_alac_m4a: usize,
+}
+
+#[derive(Debug)]
+struct ScanOutcome {
+    tracks: Vec<Track>,
+    stats: ScanStats,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SourceHandling {
     Rename,
@@ -210,6 +230,10 @@ fn target_triple() -> &'static str {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         "x86_64-pc-windows-msvc"
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        "aarch64-pc-windows-msvc"
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
@@ -275,6 +299,73 @@ fn candidate_search_roots() -> Vec<PathBuf> {
     }
 
     roots
+}
+
+fn is_windows_unc_path(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(
+                    prefix.kind(),
+                    std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _)
+                )
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn preview_cache_path_for(source: &Path) -> Result<PathBuf, String> {
+    let mut cache_root = std::env::temp_dir();
+    cache_root.push("rekordport-preview-cache");
+    fs::create_dir_all(&cache_root).map_err(|e| e.to_string())?;
+
+    let extension = source
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+    let key = format!("{:x}", md5::compute(source.to_string_lossy().as_bytes()));
+    Ok(cache_root.join(format!("{key}{extension}")))
+}
+
+fn prepare_preview_path_impl(path: String) -> Result<String, String> {
+    let source = PathBuf::from(&path);
+    if !source.exists() {
+        return Err(format!("path not found: {}", source.display()));
+    }
+    if !source.is_file() {
+        return Err(format!("preview path is not a file: {}", source.display()));
+    }
+
+    if !is_windows_unc_path(&source) {
+        return Ok(path);
+    }
+
+    let cached = preview_cache_path_for(&source)?;
+    let source_meta = fs::metadata(&source).map_err(|e| e.to_string())?;
+    let needs_refresh = match fs::metadata(&cached) {
+        Ok(meta) => meta.len() != source_meta.len(),
+        Err(_) => true,
+    };
+
+    if needs_refresh {
+        fs::copy(&source, &cached).map_err(|e| {
+            format!(
+                "failed to cache network preview file locally ({} -> {}): {}",
+                source.display(),
+                cached.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(cached.to_string_lossy().to_string())
 }
 
 fn resolve_command(command: &str) -> Option<PathBuf> {
@@ -361,6 +452,7 @@ fn file_type_name(file_type: i32, codec_name: Option<&str>) -> String {
 
     match file_type {
         4 => "M4A",
+        6 => "ALAC",
         5 => "FLAC",
         11 => "WAV",
         12 => "AIFF",
@@ -409,39 +501,6 @@ fn command_available(command: &str) -> bool {
     let available = resolve_command(command).is_some();
     guard.insert(command.to_string(), available);
     available
-}
-
-fn probe_codec_name(path: &Path) -> Result<Option<String>, String> {
-    if !command_available("ffprobe") {
-        return Ok(None);
-    }
-
-    let mut ffprobe = prepared_command("ffprobe")?;
-    ffprobe.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=codec_name",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-    ]);
-    ffprobe.arg(path);
-    let output = ffprobe.output().map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let codec = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_lowercase();
-    if codec.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(codec))
-    }
 }
 
 fn ffmpeg_has_encoder(name: &str) -> Result<bool, String> {
@@ -727,16 +786,20 @@ fn parse_optional_u32(value: Option<&str>) -> Option<u32> {
         .and_then(|value| value.parse::<u32>().ok())
 }
 
+fn sampler_path_predicate(column: &str) -> String {
+    format!(r"REPLACE(COALESCE({column}, ''), '\', '/') NOT LIKE '%/Sampler/%'")
+}
+
 fn build_scan_query(min_bit_depth: u32, include_sampler: bool) -> String {
     let sampler_filter = if include_sampler {
         String::new()
     } else {
-        "\n  AND COALESCE(c.FolderPath, '') NOT LIKE '%/Sampler/%'".to_string()
+        format!("\n  AND {}", sampler_path_predicate("c.FolderPath"))
     };
 
     format!(
-    ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 4\n    OR (c.FileType IN (11, 12) AND COALESCE(c.BitDepth, 0) > {min_bit_depth})\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
-  )
+        ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 6\n    OR (c.FileType IN (11, 12) AND COALESCE(c.BitDepth, 0) > {min_bit_depth})\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
+    )
 }
 
 fn scan_rows(
@@ -751,13 +814,6 @@ fn scan_rows(
     if !command_available("sqlcipher") {
         return Err("sqlcipher command not found in PATH or bundled sidecar".into());
     }
-    if !command_available("ffprobe") {
-        return Err(
-            "ffprobe command not found in PATH or bundled sidecar (required to detect ALAC files)"
-                .into(),
-        );
-    }
-
     let output = run_sqlcipher(
         db_path,
         key,
@@ -805,12 +861,16 @@ fn scan_tracks_with_progress<F>(
     min_bit_depth: u32,
     include_sampler: bool,
     mut on_progress: F,
-) -> Result<Vec<Track>, String>
+) -> Result<ScanOutcome, String>
 where
     F: FnMut(ScanProgressPayload),
 {
     let rows = scan_rows(db_path, key, min_bit_depth, include_sampler)?;
     let total = rows.len();
+    let mut stats = ScanStats {
+        candidate_total: total,
+        ..ScanStats::default()
+    };
     let progress_step = (total / 120).max(1);
     on_progress(ScanProgressPayload {
         phase: "processing".to_string(),
@@ -825,22 +885,12 @@ where
     let mut tracks = Vec::new();
 
     for (index, row) in rows.into_iter().enumerate() {
-        let mut codec_name = None;
-        if row.file_type == 4 && !row.full_path.is_empty() {
-            codec_name = probe_codec_name(Path::new(&row.full_path))?;
-            if codec_name.as_deref() != Some("alac") {
-                let current = index + 1;
-                if current == total || current == 1 || current % progress_step == 0 {
-                    on_progress(ScanProgressPayload {
-                        phase: "processing".to_string(),
-                        current,
-                        total,
-                        message: format!("Inspecting {current} / {total} candidate tracks…"),
-                    });
-                }
-                continue;
-            }
-        }
+        let codec_name = if row.file_type == 6 {
+            stats.m4a_candidates += 1;
+            Some("alac".to_string())
+        } else {
+            None
+        };
 
         tracks.push(Track {
             id: row.id,
@@ -868,7 +918,7 @@ where
         }
     }
 
-    Ok(tracks)
+    Ok(ScanOutcome { tracks, stats })
 }
 
 fn scan_tracks(
@@ -877,7 +927,21 @@ fn scan_tracks(
     min_bit_depth: u32,
     include_sampler: bool,
 ) -> Result<Vec<Track>, String> {
-    scan_tracks_with_progress(db_path, key, min_bit_depth, include_sampler, |_| {})
+    Ok(scan_tracks_with_progress(db_path, key, min_bit_depth, include_sampler, |_| {})?.tracks)
+}
+
+fn library_track_total(db_path: &Path, key: &str, include_sampler: bool) -> Result<usize, String> {
+    let sampler_filter = if include_sampler {
+        String::new()
+    } else {
+        format!("WHERE {}", sampler_path_predicate("FolderPath"))
+    };
+    let sql = format!("SELECT COUNT(*) FROM djmdContent {sampler_filter};");
+    let value = sqlcipher_required_value(db_path, key, &sql, "failed to count library tracks")?;
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| format!("failed to parse library track count: {error}"))
 }
 
 fn rewrite_uuid_in_path(path: &str, old_uuid: &str, new_uuid: &str) -> String {
@@ -1380,6 +1444,15 @@ fn default_database_path_value() -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            return Some(
+                PathBuf::from(app_data)
+                    .join("Pioneer/rekordbox/master.db")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+
         if let Some(home) = std::env::var_os("USERPROFILE") {
             return Some(
                 PathBuf::from(home)
@@ -1436,7 +1509,7 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
         warnings.push("ffmpeg was not found, so format conversion is unavailable. Add a bundled sidecar in src-tauri/bin or install it in the system PATH.".to_string());
     }
     if !ffprobe_available {
-        warnings.push("ffprobe was not found, so ALAC detection and some audio probing will fail. Add a bundled sidecar in src-tauri/bin or install it in the system PATH.".to_string());
+        warnings.push("ffprobe was not found, so some audio probing during conversion may be less accurate. Add a bundled sidecar in src-tauri/bin or install it in the system PATH.".to_string());
     }
     if !db_path.is_empty() && !db_exists {
         warnings.push(format!("Database path does not exist: {db_path}"));
@@ -1450,7 +1523,7 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
         warnings.push("The current ffmpeg build does not include Apple's aac_at encoder, so M4A 320kbps is usually unavailable on Windows.".to_string());
     }
 
-    let scan_ready = sqlcipher_available && ffprobe_available && db_readable;
+    let scan_ready = sqlcipher_available && db_readable;
     let convert_ready = ffmpeg_available && sqlcipher_available && db_readable;
 
     PreflightResponse {
@@ -1546,6 +1619,8 @@ fn convert_one_track(
         .suffix(&format!(".{}", spec.extension))
         .tempfile_in(output_parent)
         .map_err(|e| e.to_string())?;
+    let temp_output_path = temp_output.path().to_path_buf();
+    drop(temp_output);
 
     let conversion_result = (|| -> Result<(), String> {
         let mut ffmpeg = prepared_command("ffmpeg")?;
@@ -1561,7 +1636,7 @@ fn convert_one_track(
         if spec.extension == "m4a" {
             ffmpeg.args(["-movflags", "+faststart"]);
         }
-        ffmpeg.arg(temp_output.path());
+        ffmpeg.arg(&temp_output_path);
 
         let output = ffmpeg.output().map_err(|e| e.to_string())?;
         if !output.status.success() {
@@ -1574,12 +1649,13 @@ fn convert_one_track(
     })();
 
     if let Err(error) = conversion_result {
+        let _ = fs::remove_file(&temp_output_path);
         let _ = fs::rename(&archive_path, source);
         return Err(error);
     }
 
     if output_path.exists() {
-        let _ = fs::remove_file(temp_output.path());
+        let _ = fs::remove_file(&temp_output_path);
         let _ = fs::rename(&archive_path, source);
         return Err(format!(
             "target file already exists: {}",
@@ -1587,10 +1663,11 @@ fn convert_one_track(
         ));
     }
 
-    let persisted = temp_output
-        .persist(&output_path)
-        .map_err(|e| e.error.to_string())?;
-    drop(persisted);
+    if let Err(error) = fs::rename(&temp_output_path, &output_path) {
+        let _ = fs::remove_file(&temp_output_path);
+        let _ = fs::rename(&archive_path, source);
+        return Err(error.to_string());
+    }
 
     let channels = probe_channels(&archive_path)?;
     let sample_rate = if spec.extension == "mp3" {
@@ -2111,16 +2188,23 @@ where
         message: "Reading rekordbox database…".to_string(),
     });
 
-    let tracks = scan_tracks_with_progress(
+    let library_total =
+        library_track_total(Path::new(&req.db_path), DEFAULT_KEY, req.include_sampler)?;
+    let outcome = scan_tracks_with_progress(
         Path::new(&req.db_path),
         DEFAULT_KEY,
         req.min_bit_depth,
         req.include_sampler,
         |payload| on_progress(payload),
     )?;
+    let tracks = outcome.tracks;
     let flac = tracks
         .iter()
         .filter(|track| track.file_type == "FLAC")
+        .count();
+    let alac = tracks
+        .iter()
+        .filter(|track| track.file_type == "ALAC")
         .count();
     let hi_res = tracks
         .iter()
@@ -2129,9 +2213,15 @@ where
 
     let response = ScanResponse {
         summary: ScanSummary {
+            library_total,
+            candidate_total: outcome.stats.candidate_total,
             total: tracks.len(),
             flac,
+            alac,
             hi_res,
+            m4a_candidates: outcome.stats.m4a_candidates,
+            unreadable_m4a: outcome.stats.unreadable_m4a,
+            non_alac_m4a: outcome.stats.non_alac_m4a,
             sampler_included: req.include_sampler,
             min_bit_depth: req.min_bit_depth,
             db_path: req.db_path,
@@ -2146,7 +2236,10 @@ where
         message: if response.summary.total == 0 {
             "Scan complete. No tracks need processing.".to_string()
         } else {
-            format!("Scan complete. Found {} results.", response.summary.total)
+            format!(
+                "Scan complete. Found {} results from {} candidate tracks.",
+                response.summary.total, response.summary.candidate_total
+            )
         },
     });
 
@@ -2204,7 +2297,12 @@ fn pick_export_path(format: String, suggested_name: String) -> Option<String> {
 }
 
 #[tauri::command]
-fn open_path_in_finder(path: String) -> Result<(), String> {
+fn prepare_preview_path(path: String) -> Result<String, String> {
+    prepare_preview_path_impl(path)
+}
+
+#[tauri::command]
+fn open_path_in_file_manager(path: String) -> Result<(), String> {
     let path = PathBuf::from(path);
     if !path.exists() {
         return Err(format!("path not found: {}", path.display()));
@@ -2223,7 +2321,10 @@ fn open_path_in_finder(path: String) -> Result<(), String> {
         if status.success() {
             return Ok(());
         }
-        return Err(format!("failed to open path in Finder: {}", path.display()));
+        return Err(format!(
+            "failed to open path in the file manager: {}",
+            path.display()
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -2240,7 +2341,7 @@ fn open_path_in_finder(path: String) -> Result<(), String> {
             return Ok(());
         }
         return Err(format!(
-            "failed to open path in Explorer: {}",
+            "failed to open path in the file manager: {}",
             path.display()
         ));
     }
@@ -2329,7 +2430,8 @@ pub fn run() {
             preflight_check,
             pick_database_path,
             pick_export_path,
-            open_path_in_finder,
+            prepare_preview_path,
+            open_path_in_file_manager,
             scan_library,
             export_tracks,
             convert_tracks

@@ -20,12 +20,36 @@
           "$DOCUMENT/**",
           "$DOWNLOAD/**",
           "$PUBLIC/**",
+          "$APPDATA/**",
+          "$APPLOCALDATA/**",
           "$TEMP/**",
           "/Volumes/**",
+          "A:/**",
+          "B:/**",
           "C:/**",
           "D:/**",
           "E:/**",
-          "F:/**"
+          "F:/**",
+          "G:/**",
+          "H:/**",
+          "I:/**",
+          "J:/**",
+          "K:/**",
+          "L:/**",
+          "M:/**",
+          "N:/**",
+          "O:/**",
+          "P:/**",
+          "Q:/**",
+          "R:/**",
+          "S:/**",
+          "T:/**",
+          "U:/**",
+          "V:/**",
+          "W:/**",
+          "X:/**",
+          "Y:/**",
+          "Z:/**"
         ]
       }
     },
@@ -51,6 +75,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      }
+    },
     "externalBin": [
       "bin/sqlcipher",
       "bin/ffmpeg",

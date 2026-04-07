@@ -6,6 +6,8 @@ __pycache__/
 *.pyc
 .env
 .env.*
+release/windows-x64-portable/
+release/*-portable.zip
 src-tauri/target/
 src-tauri/gen/
 src-tauri/tauri.generated.conf.json

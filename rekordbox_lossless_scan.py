@@ -20,11 +20,24 @@ from pathlib import Path
 from typing import Iterable, List
 from xml.sax.saxutils import escape
 
-DEFAULT_DB_PATH = Path("~/Library/Pioneer/rekordbox/master.db").expanduser()
+
+def default_db_path() -> Path:
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "Pioneer" / "rekordbox" / "master.db"
+        userprofile = os.environ.get("USERPROFILE")
+        if userprofile:
+            return Path(userprofile) / "AppData" / "Roaming" / "Pioneer" / "rekordbox" / "master.db"
+    return Path("~/Library/Pioneer/rekordbox/master.db").expanduser()
+
+
+DEFAULT_DB_PATH = default_db_path()
 DEFAULT_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
 
 FILE_TYPE_NAMES = {
     4: "M4A",
+    6: "ALAC",
     5: "FLAC",
     11: "WAV",
     12: "AIFF",
@@ -106,7 +119,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_query(min_bit_depth: int, key: str, include_sampler: bool) -> str:
     sampler_filter = "" if include_sampler else """
-  AND COALESCE(c.FolderPath, '') NOT LIKE '%/Sampler/%'
+  AND REPLACE(COALESCE(c.FolderPath, ''), '\\', '/') NOT LIKE '%/Sampler/%'
 """
     return f"""
 PRAGMA key = '{key}';
@@ -127,7 +140,7 @@ LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
 WHERE
   (
     c.FileType = 5
-    OR c.FileType = 4
+    OR c.FileType = 6
     OR (c.FileType IN (11, 12) AND COALESCE(c.BitDepth, 0) > {min_bit_depth})
   )
 {sampler_filter}ORDER BY
@@ -136,42 +149,11 @@ WHERE
   full_path COLLATE NOCASE;
 """
 
-
-def probe_codec_name(path: Path) -> str | None:
-    if not shutil.which("ffprobe"):
-        raise FileNotFoundError("ffprobe command not found in PATH (required to detect ALAC files)")
-
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        text=True,
-        capture_output=True,
-    )
-
-    if result.returncode != 0:
-        return None
-
-    codec_name = result.stdout.strip().lower()
-    return codec_name or None
-
-
 def run_sqlcipher(
     sqlcipher: str, db_path: Path, key: str, min_bit_depth: int, include_sampler: bool
 ) -> List[Track]:
     if not shutil.which(sqlcipher) and Path(sqlcipher).name == sqlcipher:
         raise FileNotFoundError(f"sqlcipher not found in PATH: {sqlcipher}")
-    if not shutil.which("ffprobe"):
-        raise FileNotFoundError("ffprobe command not found in PATH (required to detect ALAC files)")
     if not db_path.exists():
         raise FileNotFoundError(f"database file not found: {db_path}")
 
@@ -193,18 +175,14 @@ def run_sqlcipher(
     for row in rows:
         file_type = int(row["file_type"]) if row["file_type"] else 0
         full_path = row["full_path"] or ""
-        codec_name: str | None = None
-        if file_type == 4 and full_path:
-            codec_name = probe_codec_name(Path(full_path))
-            if codec_name != "alac":
-                continue
+        codec_name: str | None = "alac" if file_type == 6 else None
         tracks.append(
             Track(
                 id=row["id"] or "",
                 title=row["title"] or "",
                 artist=row["artist"] or "",
                 file_type=file_type,
-                file_type_name="ALAC" if codec_name == "alac" else FILE_TYPE_NAMES.get(file_type, str(file_type)),
+                file_type_name=FILE_TYPE_NAMES.get(file_type, str(file_type)),
                 codec_name=codec_name,
                 bit_depth=int(row["bit_depth"]) if row["bit_depth"] else None,
                 sample_rate=int(row["sample_rate"]) if row["sample_rate"] else None,

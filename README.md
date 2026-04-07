@@ -45,7 +45,7 @@ python3 rekordbox_lossless_scan.py --format table
 - 一键扫描
 - 表格预览结果
 - 默认忽略 Rekordbox 自带 sampler 文件
-- ALAC 通过 `ffprobe` 按实际 codec 识别
+- ALAC 目前按 Rekordbox 数据库里的 `FileType=6` 识别
 - 选择曲目后可一键转换成 `WAV` / `AIFF`，并按源采样率自动落到 `44.1k` 或 `48k`；也可转 `MP3 320kbps` 或 `M4A 320kbps`
 - 可以选择把源文件重命名保留在原文件夹，或删除到回收站
 - 转换前会先备份数据库和原文件
@@ -219,4 +219,4 @@ python3 rekordbox_lossless_scan.py --include-sampler
 python3 rekordbox_lossless_scan.py --min-bit-depth 24
 ```
 
-`ffprobe` 是 ALAC 识别所必需的，因为扫描器会对 `FileType=4` 候选文件读取实际 codec 名称。
+扫描器现在直接按 Rekordbox 数据库里的 `FileType=6` 识别 ALAC，不再依赖 `ffprobe` 做扫描阶段的 codec 探测；`ffprobe` 仍会在部分转换音频探测里使用。

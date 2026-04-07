@@ -10,6 +10,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   tracks: [],
+  scanSummary: null,
   selectedIds: new Set(),
   conversionCompleted: false,
   loading: false,
@@ -34,6 +35,8 @@ const state = {
     currentTime: 0,
     duration: 0,
     loading: false,
+    seeking: false,
+    seekValue: 0,
   },
   settings: loadSettings(),
 };
@@ -297,8 +300,12 @@ function formatAudioMeta(track) {
   `;
 }
 
-async function openPathInFinder(path) {
-  await invoke("open_path_in_finder", { path });
+async function openPathInFileManager(path) {
+  await invoke("open_path_in_file_manager", { path });
+}
+
+async function resolvePreviewPath(path) {
+  return invoke("prepare_preview_path", { path });
 }
 
 function formatTime(value) {
@@ -318,6 +325,7 @@ function renderPlayer() {
   const track = previewTrack();
   const hasTrack = Boolean(track);
   const isPlaying = hasTrack && !audio.paused && !audio.ended;
+  const displayedTime = state.player.seeking ? state.player.seekValue : state.player.currentTime;
 
   els.playerPlay.textContent = !hasTrack
     ? "No track selected"
@@ -329,8 +337,8 @@ function renderPlayer() {
   els.playerPlay.disabled = !hasTrack || state.player.loading;
   els.playerSeek.disabled = !hasTrack || state.player.loading || !Number.isFinite(state.player.duration) || state.player.duration <= 0;
   els.playerSeek.max = String(Math.max(state.player.duration || 0, 0));
-  els.playerSeek.value = String(Math.min(Math.max(state.player.currentTime || 0, 0), state.player.duration || 0));
-  els.playerCurrent.textContent = formatTime(state.player.currentTime);
+  els.playerSeek.value = String(Math.min(Math.max(displayedTime || 0, 0), state.player.duration || 0));
+  els.playerCurrent.textContent = formatTime(displayedTime);
   els.playerTotal.textContent = formatTime(state.player.duration);
 }
 
@@ -349,7 +357,10 @@ async function loadPreviewTrack(track, autoplay = true) {
   state.player.currentTime = 0;
   state.player.duration = 0;
   state.player.loading = true;
-  const src = convertFileSrc(track.full_path);
+  state.player.seeking = false;
+  state.player.seekValue = 0;
+  const playablePath = await resolvePreviewPath(track.full_path);
+  const src = convertFileSrc(playablePath);
   els.previewAudio.src = src;
   els.previewAudio.load();
   renderPlayer();
@@ -415,18 +426,20 @@ function selectableTracks() {
 }
 
 function renderSummary() {
-  const summary = summarizeTracks(state.tracks);
+  const summary = state.scanSummary || summarizeTracks(state.tracks);
   const convertedCount = state.tracks.filter((track) => track.status === "converted").length;
   const selectedCount = state.selectedIds.size;
   const items = [
+    summary.candidate_total ? `Candidates ${formatNumber(summary.candidate_total)}` : null,
     `FLAC ${formatNumber(summary.flac)}`,
     `ALAC ${formatNumber(summary.alac)}`,
     `Hi-Res ${formatNumber(summary.hires)}`,
+    summary.unreadable_m4a ? `Unreadable M4A ${formatNumber(summary.unreadable_m4a)}` : null,
   ];
   if (convertedCount > 0) items.push(`Converted ${formatNumber(convertedCount)}`);
   if (selectedCount > 0) items.push(`Selected ${formatNumber(selectedCount)}`);
   if (els.resultsMeta) {
-    els.resultsMeta.textContent = items.join(" · ");
+    els.resultsMeta.textContent = items.filter(Boolean).join(" · ");
   }
 }
 
@@ -447,7 +460,9 @@ function renderResults() {
   const tracks = state.tracks;
   els.resultsCaption.textContent = state.loading && state.loadingTask === "scan"
     ? state.scanProgress.message || "Scanning rekordbox library…"
-    : `${formatNumber(tracks.length)} results`;
+    : state.scanSummary?.candidate_total
+      ? `${formatNumber(tracks.length)} results from ${formatNumber(state.scanSummary.candidate_total)} candidate tracks`
+      : `${formatNumber(tracks.length)} results`;
 
   if (!tracks.length) {
   els.body.innerHTML = `
@@ -480,7 +495,7 @@ function renderResults() {
           </td>
           <td>${formatAudioMeta(track)}</td>
           <td class="path-cell">
-            <button class="path-link" type="button" data-path="${escapeHtml(track.full_path)}" title="Reveal in Finder">
+            <button class="path-link" type="button" data-path="${escapeHtml(track.full_path)}" title="Reveal in folder">
               ${escapeHtml(track.full_path)}
             </button>
           </td>
@@ -547,10 +562,12 @@ async function pickDatabase() {
     const path = await invoke("pick_database_path");
     if (path) {
       els.dbPath.value = path;
+      state.scanSummary = null;
       saveSettings();
       await refreshPreflight();
       renderSummary();
       renderChips();
+      renderResults();
     }
   } catch (error) {
     setError(String(error));
@@ -583,19 +600,39 @@ async function scan() {
       analysis_state: track.analysis_state || null,
       analysis_note: track.analysis_note || "",
     }));
+    state.scanSummary = response.summary || null;
     state.selectedIds = new Set();
     state.conversionCompleted = false;
     setStatus(
       "Scanned",
-      "",
+      response.summary?.candidate_total
+        ? `${formatNumber(response.summary.candidate_total)} candidates inspected`
+        : "",
       "ready",
     );
+    if (response.summary?.library_total) {
+      const noteParts = [
+        `Scanned ${formatNumber(response.summary.candidate_total || 0)} candidate tracks from ${formatNumber(response.summary.library_total)} library entries.`,
+      ];
+      if (response.summary.unreadable_m4a) {
+        noteParts.push(
+          `${formatNumber(response.summary.unreadable_m4a)} M4A candidates could not be read at their stored paths.`
+        );
+      }
+      if (response.summary.non_alac_m4a) {
+        noteParts.push(
+          `${formatNumber(response.summary.non_alac_m4a)} M4A candidates were not ALAC.`
+        );
+      }
+      els.footerNote.textContent = noteParts.join(" ");
+    }
     renderSummary();
     renderChips();
     renderResults();
     saveSettings();
   } catch (error) {
     state.tracks = [];
+    state.scanSummary = null;
     state.selectedIds = new Set();
     state.conversionCompleted = false;
     renderSummary();
@@ -712,15 +749,19 @@ async function wireEvents() {
   });
 
   els.dbPath.addEventListener("input", () => {
+    state.scanSummary = null;
     saveSettings();
     renderSummary();
     renderChips();
+    renderResults();
     refreshPreflight().catch((error) => setError(String(error)));
   });
   els.includeSampler.addEventListener("change", () => {
+    state.scanSummary = null;
     saveSettings();
     renderSummary();
     renderChips();
+    renderResults();
   });
   els.preset.addEventListener("change", saveSettings);
   els.sourceHandling.addEventListener("change", saveSettings);
@@ -757,7 +798,7 @@ async function wireEvents() {
       if (!path) return;
 
       try {
-        await openPathInFinder(path);
+        await openPathInFileManager(path);
       } catch (error) {
         setStatus("Error", "", "error");
         setError(String(error));
@@ -781,11 +822,15 @@ async function wireEvents() {
   els.previewAudio.addEventListener("loadedmetadata", () => {
     state.player.duration = els.previewAudio.duration || 0;
     state.player.currentTime = els.previewAudio.currentTime || 0;
+    state.player.seekValue = state.player.currentTime;
     state.player.loading = false;
     renderPlayer();
   });
   els.previewAudio.addEventListener("timeupdate", () => {
     state.player.currentTime = els.previewAudio.currentTime || 0;
+    if (!state.player.seeking) {
+      state.player.seekValue = state.player.currentTime;
+    }
     renderPlayer();
   });
   els.previewAudio.addEventListener("play", () => {
@@ -799,6 +844,8 @@ async function wireEvents() {
   els.previewAudio.addEventListener("ended", () => {
     state.player.loading = false;
     state.player.currentTime = 0;
+    state.player.seeking = false;
+    state.player.seekValue = 0;
     renderPlayer();
   });
   els.previewAudio.addEventListener("error", () => {
@@ -808,10 +855,33 @@ async function wireEvents() {
     setError(`This file could not be previewed: ${previewErrorMessage()}`);
   });
   els.playerPlay.addEventListener("click", togglePreviewPlay);
+  els.playerSeek.addEventListener("pointerdown", () => {
+    state.player.seeking = true;
+    state.player.seekValue = Number(els.playerSeek.value);
+    renderPlayer();
+  });
   els.playerSeek.addEventListener("input", () => {
     if (!previewTrack()) return;
-    els.previewAudio.currentTime = Number(els.playerSeek.value);
-    state.player.currentTime = els.previewAudio.currentTime;
+    state.player.seeking = true;
+    state.player.seekValue = Number(els.playerSeek.value);
+    renderPlayer();
+  });
+  els.playerSeek.addEventListener("change", () => {
+    if (!previewTrack()) return;
+    const nextTime = Number(els.playerSeek.value);
+    els.previewAudio.currentTime = nextTime;
+    state.player.currentTime = nextTime;
+    state.player.seekValue = nextTime;
+    state.player.seeking = false;
+    renderPlayer();
+  });
+  els.playerSeek.addEventListener("pointerup", () => {
+    if (!previewTrack()) return;
+    const nextTime = Number(els.playerSeek.value);
+    els.previewAudio.currentTime = nextTime;
+    state.player.currentTime = nextTime;
+    state.player.seekValue = nextTime;
+    state.player.seeking = false;
     renderPlayer();
   });
 

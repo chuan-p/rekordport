@@ -29,9 +29,21 @@ function fallbackTargetTriple() {
   if (platform === "darwin" && arch === "arm64") return "aarch64-apple-darwin";
   if (platform === "darwin" && arch === "x64") return "x86_64-apple-darwin";
   if (platform === "win32" && arch === "x64") return "x86_64-pc-windows-msvc";
+  if (platform === "win32" && arch === "arm64") return "aarch64-pc-windows-msvc";
   if (platform === "linux" && arch === "x64") return "x86_64-unknown-linux-gnu";
 
   throw new Error(`Unsupported build host ${platform}/${arch}. Set RKB_TARGET_TRIPLE explicitly.`);
+}
+
+function parseBooleanEnv(name, env = process.env) {
+  const value = env[name];
+  if (value == null) return null;
+
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+
+  throw new Error(`Unsupported boolean value for ${name}: ${value}`);
 }
 
 function detectTargetTriple() {
@@ -64,6 +76,78 @@ function sidecarFilename(command, targetTriple) {
   return targetTriple.includes("windows")
     ? `${command}-${targetTriple}.exe`
     : `${command}-${targetTriple}`;
+}
+
+function shouldAutoFetchWindowsSidecars(env = process.env) {
+  const explicit = parseBooleanEnv("RKB_AUTO_FETCH_WINDOWS_SIDECARS", env);
+  return explicit ?? true;
+}
+
+function shouldRequireTargetSidecars(env = process.env) {
+  const explicit = parseBooleanEnv("RKB_REQUIRE_TARGET_SIDECARS", env);
+  return explicit ?? false;
+}
+
+function windowsFfmpegDefaultUrl(targetTriple) {
+  if (targetTriple === "x86_64-pc-windows-msvc") {
+    return "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-lgpl.zip";
+  }
+  if (targetTriple === "aarch64-pc-windows-msvc") {
+    return "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-winarm64-lgpl.zip";
+  }
+  return null;
+}
+
+function ensureWindowsSidecars(targetTriple) {
+  if (!targetTriple.includes("windows")) return;
+  if (process.platform !== "win32") return;
+  if (!shouldAutoFetchWindowsSidecars()) return;
+
+  const commands = ["sqlcipher", "ffmpeg", "ffprobe"];
+  const missing = commands.filter((command) => {
+    const sourcePath = path.join(tauriDir, "bin", sidecarFilename(command, targetTriple));
+    return !existsSync(sourcePath);
+  });
+
+  if (missing.length === 0) return;
+
+  const scriptPath = path.join(repoRoot, "tools", "fetch-windows-sidecars.ps1");
+  const shells = ["powershell.exe", "pwsh"];
+  let lastError = null;
+
+  console.log(
+    `[tauri-config] missing Windows sidecars for ${targetTriple}: ${missing.join(", ")}`
+  );
+  console.log("[tauri-config] fetching Windows sidecars automatically...");
+
+  for (const shellCommand of shells) {
+    try {
+      execFileSync(
+        shellCommand,
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
+        {
+          cwd: repoRoot,
+          env: {
+            ...process.env,
+            RKB_WINDOWS_TARGET_TRIPLE: targetTriple,
+            ...(windowsFfmpegDefaultUrl(targetTriple)
+              ? { RKB_FFMPEG_WINDOWS_DEFAULT_URL: windowsFfmpegDefaultUrl(targetTriple) }
+              : {}),
+          },
+          stdio: "inherit",
+        }
+      );
+      return;
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        lastError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError ?? new Error("Unable to launch PowerShell to fetch Windows sidecars.");
 }
 
 function isMacTarget(targetTriple) {
@@ -315,14 +399,41 @@ function mergeResourceConfig(baseResources, nextResources) {
   };
 }
 
+function normalizeWindowConfigForTarget(config, targetTriple) {
+  if (isMacTarget(targetTriple)) {
+    return config;
+  }
+
+  const windows = Array.isArray(config.app?.windows) ? config.app.windows : [];
+  const normalizedWindows = windows.map((windowConfig) => {
+    const nextWindow = { ...windowConfig };
+    delete nextWindow.titleBarStyle;
+    delete nextWindow.hiddenTitle;
+    delete nextWindow.trafficLightPosition;
+    return nextWindow;
+  });
+
+  return {
+    ...config,
+    app: {
+      ...config.app,
+      windows: normalizedWindows,
+    },
+  };
+}
+
 const targetTriple = detectTargetTriple();
-const config = JSON.parse(readFileSync(baseConfigPath, "utf8"));
+const config = normalizeWindowConfigForTarget(
+  JSON.parse(readFileSync(baseConfigPath, "utf8")),
+  targetTriple
+);
 const externalBins = Array.isArray(config.bundle?.externalBin) ? config.bundle.externalBin : [];
 const bundledBins = [];
 const skippedBins = [];
 const sidecarSummaries = [];
 let generatedResources = {};
 
+ensureWindowsSidecars(targetTriple);
 ensureCleanDir(generatedBinDir);
 ensureCleanDir(generatedResourceDir);
 
@@ -357,6 +468,16 @@ for (const entry of externalBins) {
     `${command} -> ${normalizeRelative(path.relative(repoRoot, realpathSync(sourcePath)))}${
       dylibCount > 0 ? ` (+${dylibCount} bundled dylibs)` : ""
     }`
+  );
+}
+
+if (shouldRequireTargetSidecars() && skippedBins.length > 0) {
+  throw new Error(
+    [
+      `Missing required sidecars for ${targetTriple}.`,
+      `Expected: ${skippedBins.join(", ")}.`,
+      "Release builds must bundle their target sidecars; add them to src-tauri/bin or provide them through the Windows fetch step.",
+    ].join(" ")
   );
 }
 
