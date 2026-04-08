@@ -15,6 +15,8 @@ OUTPUT_DIR = Path("/Users/chuanpeng/Documents/rkb-lossless-process/release/icon-
 CANVAS_SIZE = 1024
 APP_BACKGROUND = (28, 28, 31, 255)
 APP_GLYPH = (242, 243, 245, 255)
+LIGHT_BACKGROUND = (246, 246, 243, 255)
+LIGHT_GLYPH = (95, 96, 99, 255)
 
 
 def extract_mask(image: Image.Image, threshold: int = 84) -> Image.Image:
@@ -144,11 +146,23 @@ def main() -> None:
     final = Image.alpha_composite(bg, glyph)
     final.save(OUTPUT_DIR / "app-icon-flat-app-tone-v2-1024.png")
 
+    light_bg = rounded_background(CANVAS_SIZE, LIGHT_BACKGROUND)
+    light_glyph = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), LIGHT_GLYPH)
+    light_glyph.putalpha(alpha)
+    light_final = Image.alpha_composite(light_bg, light_glyph)
+    light_final.save(OUTPUT_DIR / "app-icon-flat-light-v2-1024.png")
+
     transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
     plain = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), APP_GLYPH)
     plain.putalpha(alpha)
     transparent = Image.alpha_composite(transparent, plain)
     transparent.save(OUTPUT_DIR / "glyph-flat-app-tone-v2-1024.png")
+
+    light_transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
+    light_plain = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), LIGHT_GLYPH)
+    light_plain.putalpha(alpha)
+    light_transparent = Image.alpha_composite(light_transparent, light_plain)
+    light_transparent.save(OUTPUT_DIR / "glyph-flat-light-v2-1024.png")
 
 
 if __name__ == "__main__":

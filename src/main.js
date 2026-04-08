@@ -175,7 +175,7 @@ function renderConvertButton() {
   const convertReady = state.preflight ? state.preflight.convert_ready : true;
 
   if (!state.loading && selectedCount === 0 && state.conversionCompleted) {
-    els.convert.textContent = "Convertion Completed";
+    els.convert.textContent = "Conversion Completed";
     els.convert.disabled = true;
     return;
   }
@@ -691,6 +691,19 @@ async function convertSelected() {
   const tracks = selectedTracks();
   if (!tracks.length) {
     setError("Select at least one track to convert.");
+    return;
+  }
+
+  try {
+    const rekordboxRunning = await invoke("rekordbox_process_running");
+    if (rekordboxRunning) {
+      window.alert("rekordbox appears to be running. Please close rekordbox before converting, then try again. No files or database rows were changed.");
+      setError("Close rekordbox before converting, then try again.");
+      return;
+    }
+  } catch (error) {
+    setStatus("Error", "", "error");
+    setError(`Could not check whether rekordbox is running: ${String(error)}`);
     return;
   }
 

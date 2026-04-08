@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "vite build",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "check": "npm run build && npm test",
     "tauri": "node tools/run-tauri.mjs"
   },
   "dependencies": {

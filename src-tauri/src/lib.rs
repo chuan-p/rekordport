@@ -18,6 +18,11 @@ use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+mod conversion_session;
+#[cfg(test)]
+mod migration_fixture_tests;
+mod process;
+
 const DEFAULT_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -2512,9 +2517,7 @@ where
     copy_path(&db_path, &db_backup)?;
 
     let music_backup_root = backup_root.join("music");
-    let mut converted_tracks: Vec<Track> = Vec::with_capacity(req.tracks.len());
-    let mut archive_paths: Vec<PathBuf> = Vec::new();
-    let mut output_paths: Vec<PathBuf> = Vec::new();
+    let mut session = conversion_session::ConversionSession::new();
     let total_tracks = req.tracks.len();
 
     on_progress(ScanProgressPayload {
@@ -2534,38 +2537,10 @@ where
         });
         match convert_one_track(track, &spec, &music_backup_root) {
             Ok((converted_track, output_path, archive_path)) => {
-                archive_paths.push(archive_path);
-                output_paths.push(output_path);
-                converted_tracks.push(converted_track);
+                session.push(track, converted_track, output_path, archive_path);
             }
             Err(error) => {
-                for path in output_paths {
-                    let _ = remove_file_path(&path);
-                }
-                for archive_path in archive_paths {
-                    let source_path = req
-                        .tracks
-                        .iter()
-                        .find(|candidate| {
-                            let current = Path::new(&candidate.full_path);
-                            if let (Some(stem), Some(ext)) =
-                                (current.file_stem(), current.extension())
-                            {
-                                archive_path.file_name().is_some_and(|name| {
-                                    let expected_prefix = format!("{}-", stem.to_string_lossy());
-                                    let expected_suffix = format!(".{}", ext.to_string_lossy());
-                                    let file_name = name.to_string_lossy();
-                                    file_name.starts_with(&expected_prefix)
-                                        && file_name.ends_with(&expected_suffix)
-                                })
-                            } else {
-                                false
-                            }
-                        })
-                        .map(|candidate| PathBuf::from(&candidate.full_path))
-                        .unwrap_or_else(|| archive_path.clone());
-                    let _ = rename_path(&archive_path, &source_path);
-                }
+                session.rollback_all();
                 return Err(error);
             }
         }
@@ -2578,17 +2553,12 @@ where
         message: "Migrating metadata and analysis…".to_string(),
     });
 
+    let converted_tracks = session.converted_tracks();
     let migrated_tracks =
         match migrate_tracks_in_db(&db_path, &req.tracks, &converted_tracks, DEFAULT_KEY, &spec) {
             Ok(tracks) => tracks,
             Err(error) => {
-                for output_path in &output_paths {
-                    let _ = remove_file_path(output_path);
-                }
-                for (track, archive_path) in req.tracks.iter().zip(archive_paths.iter()) {
-                    let source_path = PathBuf::from(&track.full_path);
-                    let _ = rename_path(archive_path, &source_path);
-                }
+                session.rollback_all();
                 return Err(error);
             }
         };
@@ -2604,7 +2574,7 @@ where
     let mut source_cleanup_failures = 0usize;
 
     if matches!(source_handling, SourceHandling::Trash) {
-        for archive_path in &archive_paths {
+        for archive_path in session.archive_paths() {
             if trash::delete(archive_path).is_err() {
                 source_cleanup_failures += 1;
             }
@@ -2882,6 +2852,11 @@ async fn preflight_check(req: PreflightRequest) -> Result<PreflightResponse, Str
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+fn rekordbox_process_running() -> Result<bool, String> {
+    process::rekordbox_process_running()
+}
+
 pub fn run() {
     #[cfg(target_os = "windows")]
     if let Err(error) = ensure_webview2_runtime_before_launch() {
@@ -2899,6 +2874,7 @@ pub fn run() {
             open_path_in_file_manager,
             scan_library,
             export_tracks,
+            rekordbox_process_running,
             convert_tracks
         ])
         .run(tauri::generate_context!())
