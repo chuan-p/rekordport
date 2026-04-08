@@ -39,12 +39,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Run project checks
-        run: npm run check
-
       - name: Download Windows sidecars
         shell: pwsh
         run: ./tools/fetch-windows-sidecars.ps1
+
+      - name: Run project checks
+        run: npm run check
 
       - name: Build Windows release
         run: npm run tauri build -- --bundles nsis
