@@ -5,6 +5,7 @@ import "./style.css";
 const DEFAULT_MIN_BIT_DEPTH = 16;
 const STORAGE_KEY = "rekordbox-lossless-scan-settings";
 const IS_MACOS = /\bMac OS X\b|\bMacintosh\b/.test(navigator.userAgent);
+const IS_WINDOWS = /\bWindows\b/.test(navigator.userAgent);
 
 const $ = (id) => document.getElementById(id);
 
@@ -412,14 +413,17 @@ function togglePreviewPlay() {
 function waitForPreviewAudioRelease(audio) {
   return new Promise((resolve) => {
     let settled = false;
+    const settleDelay = IS_WINDOWS ? 1200 : 150;
     const finish = () => {
       if (settled) return;
       settled = true;
       window.clearTimeout(timeout);
       audio.removeEventListener("emptied", finish);
-      window.requestAnimationFrame(() => resolve());
+      window.setTimeout(() => {
+        window.requestAnimationFrame(() => resolve());
+      }, settleDelay);
     };
-    const timeout = window.setTimeout(finish, 300);
+    const timeout = window.setTimeout(finish, settleDelay + 300);
     audio.addEventListener("emptied", finish, { once: true });
     audio.load();
   });

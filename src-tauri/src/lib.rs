@@ -598,14 +598,15 @@ where
     F: FnMut() -> io::Result<T>,
 {
     let action = action.into();
-    let attempts = if cfg!(target_os = "windows") { 12 } else { 1 };
+    let attempts = if cfg!(target_os = "windows") { 24 } else { 1 };
 
     for attempt in 0..attempts {
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) => {
                 if attempt + 1 < attempts && is_windows_lock_error(&error) {
-                    thread::sleep(Duration::from_millis(150));
+                    let delay_ms = 150 + (attempt as u64 * 150).min(1_500);
+                    thread::sleep(Duration::from_millis(delay_ms));
                     continue;
                 }
                 return Err(io_error_message(&action, &error));
@@ -866,7 +867,29 @@ fn backup_relative_path(path: &Path) -> PathBuf {
     let mut rel = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => rel.push(prefix.as_os_str()),
+            Component::Prefix(prefix) => {
+                #[cfg(target_os = "windows")]
+                {
+                    match prefix.kind() {
+                        std::path::Prefix::Disk(letter)
+                        | std::path::Prefix::VerbatimDisk(letter) => {
+                            rel.push(format!("drive-{}", char::from(letter)));
+                        }
+                        std::path::Prefix::UNC(server, share)
+                        | std::path::Prefix::VerbatimUNC(server, share) => {
+                            rel.push("unc");
+                            rel.push(server);
+                            rel.push(share);
+                        }
+                        _ => rel.push(prefix.as_os_str()),
+                    }
+                }
+
+                #[cfg(not(target_os = "windows"))]
+                {
+                    rel.push(prefix.as_os_str());
+                }
+            }
             Component::RootDir => {}
             Component::CurDir => rel.push("."),
             Component::ParentDir => rel.push(".."),
