@@ -69,6 +69,10 @@ struct ConvertRequest {
     preset: String,
     #[serde(rename = "sourceHandling")]
     source_handling: String,
+    #[serde(rename = "archiveConflictResolution", default)]
+    archive_conflict_resolution: Option<String>,
+    #[serde(rename = "outputConflictResolution", default)]
+    output_conflict_resolution: Option<String>,
     tracks: Vec<Track>,
 }
 
@@ -161,6 +165,7 @@ struct ContentFileRef {
     id: String,
     path: String,
     rb_local_path: Option<String>,
+    uuid: Option<String>,
     hash: Option<String>,
     size: Option<u64>,
 }
@@ -168,6 +173,8 @@ struct ContentFileRef {
 #[derive(Debug)]
 struct MigratedContentFile {
     original: ContentFileRef,
+    new_id: String,
+    new_uuid: Option<String>,
     new_path: String,
     new_local_path: Option<String>,
     hash: String,
@@ -184,6 +191,13 @@ struct ValidatedContentFile {
 struct CleanupReport {
     archived_dirs: usize,
     archive_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictResolution {
+    Error,
+    Overwrite,
+    Redirect,
 }
 
 #[derive(Debug, Clone)]
@@ -863,6 +877,47 @@ fn timestamp_token() -> String {
     secs.to_string()
 }
 
+fn conflict_resolution_mode(value: Option<&str>) -> Result<ConflictResolution, String> {
+    match value
+        .unwrap_or("error")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "error" => Ok(ConflictResolution::Error),
+        "overwrite" => Ok(ConflictResolution::Overwrite),
+        "redirect" => Ok(ConflictResolution::Redirect),
+        other => Err(format!("unsupported conflict resolution mode: {other}")),
+    }
+}
+
+fn unique_redirect_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("missing parent directory for {}", path.display()))?;
+    let stem = path
+        .file_stem()
+        .ok_or_else(|| format!("missing file stem for {}", path.display()))?
+        .to_string_lossy()
+        .to_string();
+    let extension = path
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+
+    for index in 2..10_000 {
+        let candidate = parent.join(format!("{stem} ({index}){extension}"));
+        if !path_exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+
+    Err(format!(
+        "could not find an available redirected file name for {}",
+        path.display()
+    ))
+}
+
 fn backup_relative_path(path: &Path) -> PathBuf {
     let mut rel = PathBuf::new();
     for component in path.components() {
@@ -1402,9 +1457,83 @@ fn rewrite_uuid_in_path(path: &str, old_uuid: &str, new_uuid: &str) -> String {
     let old_split_encoded = format!("{}%2F{}", &old_uuid[..3], &old_uuid[3..]);
     let new_split_encoded = format!("{}%2F{}", &new_uuid[..3], &new_uuid[3..]);
 
-    path.replace(old_uuid, new_uuid)
-        .replace(&old_split, &new_split)
-        .replace(&old_split_encoded, &new_split_encoded)
+    let replaced_uuid = replace_ascii_case_insensitive(path, old_uuid, new_uuid);
+    let replaced_split = replace_ascii_case_insensitive(&replaced_uuid, &old_split, &new_split);
+    replace_ascii_case_insensitive(&replaced_split, &old_split_encoded, &new_split_encoded)
+}
+
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+
+    let haystack_lower = haystack.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut rewritten = String::with_capacity(haystack.len());
+    let mut cursor = 0usize;
+
+    while let Some(found) = haystack_lower[cursor..].find(&needle_lower) {
+        let start = cursor + found;
+        let end = start + needle.len();
+        rewritten.push_str(&haystack[cursor..start]);
+        rewritten.push_str(replacement);
+        cursor = end;
+    }
+
+    rewritten.push_str(&haystack[cursor..]);
+    rewritten
+}
+
+fn rewrite_analysis_resource_value(
+    value: &str,
+    old_track_uuid: &str,
+    old_file_uuid: Option<&str>,
+    new_uuid: &str,
+) -> String {
+    let rewritten = rewrite_uuid_in_path(value, old_track_uuid, new_uuid);
+    if rewritten != value {
+        return rewritten;
+    }
+
+    let Some(old_file_uuid) = old_file_uuid.filter(|uuid| !uuid.is_empty()) else {
+        return value.to_string();
+    };
+
+    rewrite_uuid_in_path(value, old_file_uuid, new_uuid)
+}
+
+fn fallback_analysis_resource_path(value: &str, new_uuid: &str) -> Option<String> {
+    let source = Path::new(value);
+    let file_name = source.file_name()?;
+    let uuid_tail_dir = source.parent()?;
+    let uuid_head_dir = uuid_tail_dir.parent()?;
+    let base_dir = uuid_head_dir.parent()?;
+    let uuid_head = uuid_head_dir.file_name()?.to_string_lossy();
+    let uuid_tail = uuid_tail_dir.file_name()?.to_string_lossy();
+
+    if uuid_head.len() != 3 || uuid_tail.is_empty() {
+        return None;
+    }
+
+    let mut destination = base_dir.to_path_buf();
+    destination.push(&new_uuid[..3]);
+    destination.push(&new_uuid[3..]);
+    destination.push(file_name);
+    Some(destination.to_string_lossy().to_string())
+}
+
+fn rewrite_analysis_resource_path(
+    value: &str,
+    old_track_uuid: &str,
+    old_file_uuid: Option<&str>,
+    new_uuid: &str,
+) -> String {
+    let rewritten = rewrite_analysis_resource_value(value, old_track_uuid, old_file_uuid, new_uuid);
+    if rewritten != value {
+        return rewritten;
+    }
+
+    fallback_analysis_resource_path(value, new_uuid).unwrap_or_else(|| value.to_string())
 }
 
 fn fetch_content_files(
@@ -1422,7 +1551,7 @@ fn fetch_content_files(
         let id = parts.next().unwrap_or_default().to_string();
         let path = parts.next().unwrap_or_default().to_string();
         let rb_local_path = parts.next().unwrap_or_default().to_string();
-        let _uuid = parts.next().unwrap_or_default().to_string();
+        let uuid = parts.next().unwrap_or_default().to_string();
         let hash = parts.next().unwrap_or_default().to_string();
         let size = parts.next().unwrap_or_default().to_string();
         if id.is_empty() || path.is_empty() {
@@ -1436,6 +1565,7 @@ fn fetch_content_files(
             } else {
                 Some(rb_local_path)
             },
+            uuid: if uuid.is_empty() { None } else { Some(uuid) },
             hash: if hash.is_empty() { None } else { Some(hash) },
             size: size.parse::<u64>().ok(),
         });
@@ -1770,6 +1900,7 @@ fn validate_analysis_resources(
                 id: file.id.clone(),
                 path: file.path.clone(),
                 rb_local_path: file.rb_local_path.clone(),
+                uuid: file.uuid.clone(),
                 hash: file.hash.clone(),
                 size: file.size,
             },
@@ -2017,7 +2148,11 @@ fn backup_file_tree(source: &Path, backup_root: &Path) -> Result<PathBuf, String
     Ok(target)
 }
 
-fn build_target_path(source: &Path, spec: &ConversionSpec) -> Result<PathBuf, String> {
+fn build_target_path(
+    source: &Path,
+    spec: &ConversionSpec,
+    resolution: ConflictResolution,
+) -> Result<PathBuf, String> {
     let parent = source
         .parent()
         .ok_or_else(|| format!("missing parent directory for {}", source.display()))?;
@@ -2025,10 +2160,26 @@ fn build_target_path(source: &Path, spec: &ConversionSpec) -> Result<PathBuf, St
         .file_stem()
         .ok_or_else(|| format!("missing file stem for {}", source.display()))?
         .to_string_lossy();
-    Ok(parent.join(format!("{stem}.{}", spec.extension)))
+    let candidate = parent.join(format!("{stem}.{}", spec.extension));
+    if !path_exists(&candidate)? {
+        return Ok(candidate);
+    }
+
+    match resolution {
+        ConflictResolution::Error => Err(format!(
+            "target file already exists: {}",
+            candidate.display()
+        )),
+        ConflictResolution::Overwrite => Ok(candidate),
+        ConflictResolution::Redirect => unique_redirect_path(&candidate),
+    }
 }
 
-fn build_source_archive_path(source: &Path, bitrate_kbps: u32) -> Result<PathBuf, String> {
+fn build_source_archive_path(
+    source: &Path,
+    bitrate_kbps: u32,
+    resolution: ConflictResolution,
+) -> Result<PathBuf, String> {
     let parent = source
         .parent()
         .ok_or_else(|| format!("missing parent directory for {}", source.display()))?;
@@ -2045,19 +2196,26 @@ fn build_source_archive_path(source: &Path, bitrate_kbps: u32) -> Result<PathBuf
     } else {
         parent.join(format!("{stem}-{bitrate_kbps}kbps.{extension}"))
     };
-    if path_exists(&candidate)? {
-        return Err(format!(
+    if !path_exists(&candidate)? {
+        return Ok(candidate);
+    }
+
+    match resolution {
+        ConflictResolution::Error => Err(format!(
             "source archive already exists, refusing to overwrite: {}",
             candidate.display()
-        ));
+        )),
+        ConflictResolution::Overwrite => Ok(candidate),
+        ConflictResolution::Redirect => unique_redirect_path(&candidate),
     }
-    Ok(candidate)
 }
 
 fn convert_one_track(
     track: &Track,
     spec: &ConversionSpec,
     backup_root: &Path,
+    archive_conflict_resolution: ConflictResolution,
+    output_conflict_resolution: ConflictResolution,
 ) -> Result<(Track, PathBuf, PathBuf), String> {
     let source = Path::new(&track.full_path);
     if !path_exists(source)? {
@@ -2067,10 +2225,26 @@ fn convert_one_track(
     let source_sample_rate = probe_sample_rate(source)?.or(track.sample_rate);
     let target_sample_rate = target_sample_rate_for_source(source_sample_rate);
     let source_bitrate = source_bitrate_kbps(track, source)?;
-    let archive_path = build_source_archive_path(source, source_bitrate)?;
-    let output_path = build_target_path(source, spec)?;
+    let mut archive_path =
+        build_source_archive_path(source, source_bitrate, archive_conflict_resolution)?;
+    let mut output_path = build_target_path(source, spec, output_conflict_resolution)?;
 
     backup_file_tree(source, backup_root)?;
+
+    if path_exists(&archive_path)? {
+        match archive_conflict_resolution {
+            ConflictResolution::Error => {
+                return Err(format!(
+                    "source archive already exists, refusing to overwrite: {}",
+                    archive_path.display()
+                ));
+            }
+            ConflictResolution::Overwrite => remove_file_path(&archive_path)?,
+            ConflictResolution::Redirect => {
+                archive_path = unique_redirect_path(&archive_path)?;
+            }
+        }
+    }
 
     rename_path(source, &archive_path)?;
 
@@ -2141,12 +2315,33 @@ fn convert_one_track(
     }
 
     if path_exists(&output_path)? {
-        let _ = remove_file_path(&temp_output_path);
-        let _ = rename_path(&archive_path, source);
-        return Err(format!(
-            "target file already exists: {}",
-            output_path.display()
-        ));
+        match output_conflict_resolution {
+            ConflictResolution::Error => {
+                let _ = remove_file_path(&temp_output_path);
+                let _ = rename_path(&archive_path, source);
+                return Err(format!(
+                    "target file already exists: {}",
+                    output_path.display()
+                ));
+            }
+            ConflictResolution::Overwrite => {
+                if let Err(error) = remove_file_path(&output_path) {
+                    let _ = remove_file_path(&temp_output_path);
+                    let _ = rename_path(&archive_path, source);
+                    return Err(error);
+                }
+            }
+            ConflictResolution::Redirect => {
+                output_path = match unique_redirect_path(&output_path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = remove_file_path(&temp_output_path);
+                        let _ = rename_path(&archive_path, source);
+                        return Err(error);
+                    }
+                };
+            }
+        }
     }
 
     if let Err(error) = rename_path(&temp_output_path, &output_path) {
@@ -2257,25 +2452,42 @@ fn migrate_tracks_in_db(
                             file.original.rb_local_path.as_ref().ok_or_else(|| {
                                 format!("analysis resource path missing for {}", file.original.id)
                             })?;
-                        let destination = PathBuf::from(rewrite_uuid_in_path(
+                        let destination_path = rewrite_analysis_resource_path(
                             source_path,
                             &old_uuid,
+                            file.original.uuid.as_deref(),
                             &content_uuid,
-                        ));
+                        );
+                        let destination = PathBuf::from(&destination_path);
                         copy_file_with_parent_dirs(&file.source, &destination)?;
                         rewrite_anlz_ppth(&destination, &file_name)?;
                         copied_resources.push(destination.clone());
                         let size = metadata_path(&destination)?.len();
                         let hash = md5_hex(&destination)?;
-                        let new_path =
-                            rewrite_uuid_in_path(&file.original.path, &old_uuid, &content_uuid);
-                        let new_local_path = file
-                            .original
-                            .rb_local_path
-                            .as_ref()
-                            .map(|path| rewrite_uuid_in_path(path, &old_uuid, &content_uuid));
+                        let new_id = rewrite_analysis_resource_value(
+                            &file.original.id,
+                            &old_uuid,
+                            file.original.uuid.as_deref(),
+                            &content_uuid,
+                        );
+                        let new_path = rewrite_analysis_resource_path(
+                            &file.original.path,
+                            &old_uuid,
+                            file.original.uuid.as_deref(),
+                            &content_uuid,
+                        );
+                        let new_local_path = file.original.rb_local_path.as_ref().map(|path| {
+                            rewrite_analysis_resource_path(
+                                path,
+                                &old_uuid,
+                                file.original.uuid.as_deref(),
+                                &content_uuid,
+                            )
+                        });
                         migrated_content_files.push(MigratedContentFile {
                             original: file.original,
+                            new_id,
+                            new_uuid: Some(content_uuid.clone()),
                             new_path,
                             new_local_path,
                             hash,
@@ -2323,7 +2535,7 @@ fn migrate_tracks_in_db(
             let new_analysis_path = if old_analysis_path.is_empty() || missing_analysis_resource {
                 old_analysis_path.clone()
             } else {
-                rewrite_uuid_in_path(&old_analysis_path, &old_uuid, &content_uuid)
+                rewrite_analysis_resource_path(&old_analysis_path, &old_uuid, None, &content_uuid)
             };
             let new_analysis_path = if missing_analysis_resource {
                 String::new()
@@ -2419,8 +2631,13 @@ fn migrate_tracks_in_db(
             for file in &migrated_content_files {
                 let new_local_path = file.new_local_path.clone().unwrap_or_default();
                 sql.push_str(&format!(
-          "UPDATE contentFile SET ID = {}, ContentID = {new_content_id_expr}, Path = {}, rb_local_path = {}, Hash = {}, Size = {}, updated_at = {now_expr} WHERE ID = {} AND ContentID = {};\n",
-          sql_quote(&rewrite_uuid_in_path(&file.original.id, &old_uuid, &content_uuid)),
+          "UPDATE contentFile SET ID = {}, ContentID = {new_content_id_expr}, UUID = {}, Path = {}, rb_local_path = {}, Hash = {}, Size = {}, updated_at = {now_expr} WHERE ID = {} AND ContentID = {};\n",
+          sql_quote(&file.new_id),
+          file
+            .new_uuid
+            .as_ref()
+            .map(|uuid| sql_quote(uuid))
+            .unwrap_or_else(|| "UUID".to_string()),
           sql_quote(&file.new_path),
           if new_local_path.is_empty() {
             "NULL".to_string()
@@ -2517,6 +2734,10 @@ where
 
     let spec = preset_spec(&req.preset)?;
     let source_handling = source_handling_mode(&req.source_handling)?;
+    let archive_conflict_resolution =
+        conflict_resolution_mode(req.archive_conflict_resolution.as_deref())?;
+    let output_conflict_resolution =
+        conflict_resolution_mode(req.output_conflict_resolution.as_deref())?;
     let db_path = PathBuf::from(&req.db_path);
     if !path_exists(&db_path)? {
         return Err(format!("database file not found: {}", db_path.display()));
@@ -2558,7 +2779,13 @@ where
             total: total_tracks,
             message: format!("Converting {} / {} tracks…", current, total_tracks),
         });
-        match convert_one_track(track, &spec, &music_backup_root) {
+        match convert_one_track(
+            track,
+            &spec,
+            &music_backup_root,
+            archive_conflict_resolution,
+            output_conflict_resolution,
+        ) {
             Ok((converted_track, output_path, archive_path)) => {
                 session.push(track, converted_track, output_path, archive_path);
             }
@@ -2964,6 +3191,69 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
     }
 
     #[test]
+    fn rewrites_uuid_paths_case_insensitively() {
+        let rewritten = rewrite_uuid_in_path(
+            "D:/PIONEER/Master/share/PIONEER/USBANLZ/A49/581BE-9886-4241-90C9-02B687C04804/ANLZ0000.DAT",
+            "a49581be-9886-4241-90c9-02b687c04804",
+            "11111111-2222-3333-4444-555555555555",
+        );
+
+        assert_eq!(
+            rewritten,
+            "D:/PIONEER/Master/share/PIONEER/USBANLZ/111/11111-2222-3333-4444-555555555555/ANLZ0000.DAT"
+        );
+    }
+
+    #[test]
+    fn rewrites_analysis_resource_paths_using_fallback_layout() {
+        let rewritten = rewrite_analysis_resource_path(
+            "D:/PIONEER/Master/share/PIONEER/USBANLZ/a49/581be-9886-4241-90c9-02b687c04804/ANLZ0000.2EX",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            None,
+            "11111111-2222-3333-4444-555555555555",
+        );
+
+        assert_eq!(
+            rewritten,
+            "D:/PIONEER/Master/share/PIONEER/USBANLZ/111/11111-2222-3333-4444-555555555555/ANLZ0000.2EX"
+        );
+    }
+
+    #[test]
+    fn redirects_existing_target_file_names() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("track.flac");
+        fs::write(&source, b"source").expect("source fixture should be written");
+        fs::write(dir.path().join("track.mp3"), b"existing").expect("existing target should exist");
+
+        let spec = preset_spec("mp3-320").expect("preset should be valid");
+        let redirected = build_target_path(&source, &spec, ConflictResolution::Redirect)
+            .expect("redirected target path should be created");
+
+        assert_eq!(
+            redirected.file_name().and_then(|name| name.to_str()),
+            Some("track (2).mp3")
+        );
+    }
+
+    #[test]
+    fn redirects_existing_archive_file_names() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("track.flac");
+        fs::write(&source, b"source").expect("source fixture should be written");
+        fs::write(dir.path().join("track-1000kbps.flac"), b"existing")
+            .expect("existing archive should exist");
+
+        let redirected = build_source_archive_path(&source, 1000, ConflictResolution::Redirect)
+            .expect("redirected archive path should be created");
+
+        assert_eq!(
+            redirected.file_name().and_then(|name| name.to_str()),
+            Some("track-1000kbps (2).flac")
+        );
+    }
+
+    #[test]
     #[ignore]
     fn migrate_real_master_db_track() {
         let db_path = "/Users/chuanpeng/Library/Pioneer/rekordbox/master.db".to_string();
@@ -2987,6 +3277,8 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
                 db_path: db_path.clone(),
                 preset: "mp3-320".to_string(),
                 source_handling: "rename".to_string(),
+                archive_conflict_resolution: None,
+                output_conflict_resolution: None,
                 tracks: vec![track.clone()],
             },
             |_| {},

@@ -237,6 +237,39 @@ function setError(message) {
   els.footerError.textContent = message;
 }
 
+function existingFileConflictMessage(error) {
+  const text = String(error || "");
+  if (text.startsWith("source archive already exists, refusing to overwrite: ")) {
+    return {
+      kind: "archive",
+      path: text.slice("source archive already exists, refusing to overwrite: ".length),
+    };
+  }
+  if (text.startsWith("target file already exists: ")) {
+    return {
+      kind: "output",
+      path: text.slice("target file already exists: ".length),
+    };
+  }
+  return null;
+}
+
+function promptConflictResolution(conflict) {
+  const label = conflict.kind === "archive" ? "archived source file" : "output file";
+  const answer = window.prompt(
+    `An existing ${label} was found:\n\n${conflict.path}\n\nType "redirect" to keep the old file and create a new numbered file, or type "overwrite" to replace the old file.`,
+    "redirect",
+  );
+  if (answer == null) return null;
+
+  const normalized = answer.trim().toLowerCase();
+  if (normalized === "redirect" || normalized === "r") return "redirect";
+  if (normalized === "overwrite" || normalized === "o") return "overwrite";
+
+  window.alert('Type "redirect" or "overwrite".');
+  return null;
+}
+
 function formatNumber(value) {
   return new Intl.NumberFormat("en-US").format(value);
 }
@@ -691,7 +724,7 @@ async function scan() {
   }
 }
 
-async function convertSelected() {
+async function convertSelected(conflictResolution = "error") {
   const tracks = selectedTracks();
   if (!tracks.length) {
     setError("Select at least one track to convert.");
@@ -727,6 +760,8 @@ async function convertSelected() {
         dbPath: els.dbPath.value,
         preset: els.preset.value,
         sourceHandling: els.sourceHandling.value,
+        archiveConflictResolution: conflictResolution,
+        outputConflictResolution: conflictResolution,
         tracks,
       },
     });
@@ -770,6 +805,22 @@ async function convertSelected() {
     renderResults();
     saveSettings();
   } catch (error) {
+    const conflict = conflictResolution === "error" ? existingFileConflictMessage(error) : null;
+    if (conflict) {
+      const nextResolution = promptConflictResolution(conflict);
+      if (nextResolution) {
+        setLoading(false);
+        setConvertProgress({
+          active: false,
+          phase: "idle",
+          current: 0,
+          total: 0,
+          message: "",
+        });
+        await convertSelected(nextResolution);
+        return;
+      }
+    }
     setStatus("Error", "", "error");
     setError(String(error));
   } finally {
