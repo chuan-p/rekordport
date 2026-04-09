@@ -270,6 +270,15 @@ function promptConflictResolution(conflict) {
   return null;
 }
 
+function normalizeConflictResolution(value) {
+  if (typeof value !== "string") return "error";
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "redirect" || normalized === "overwrite" || normalized === "error") {
+    return normalized;
+  }
+  return "error";
+}
+
 function formatNumber(value) {
   return new Intl.NumberFormat("en-US").format(value);
 }
@@ -725,6 +734,7 @@ async function scan() {
 }
 
 async function convertSelected(conflictResolution = "error") {
+  conflictResolution = normalizeConflictResolution(conflictResolution);
   const tracks = selectedTracks();
   if (!tracks.length) {
     setError("Select at least one track to convert.");
@@ -877,7 +887,12 @@ async function wireEvents() {
 
   els.pickDb.addEventListener("click", pickDatabase);
   els.scan.addEventListener("click", scan);
-  els.convert.addEventListener("click", convertSelected);
+  els.convert.addEventListener("click", () => {
+    convertSelected().catch((error) => {
+      setStatus("Error", "", "error");
+      setError(String(error));
+    });
+  });
   els.selectAll.addEventListener("change", () => {
     state.selectedIds = new Set(
       els.selectAll.checked ? selectableTracks().map((track) => track.id) : [],
