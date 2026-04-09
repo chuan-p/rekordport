@@ -30,6 +30,8 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const WEBVIEW2_BOOTSTRAPPER_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
 #[cfg(any(target_os = "windows", test))]
 const WEBVIEW2_CLIENT_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+#[cfg(target_os = "windows")]
+const WEBVIEW2_INSTALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Deserialize)]
 struct ScanRequest {
@@ -315,9 +317,27 @@ fn parse_webview2_registry_version(reg_query_stdout: &str) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn webview2_bootstrapper_path() -> PathBuf {
-    env::temp_dir()
-        .join("rekordport-webview2")
-        .join("MicrosoftEdgeWebview2Setup.exe")
+    runtime_support_root("webview2").join("MicrosoftEdgeWebview2Setup.exe")
+}
+
+#[cfg(target_os = "windows")]
+fn runtime_support_root(category: &str) -> PathBuf {
+    env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("rekordport")
+        .join(category)
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_download_error(shell: &str, stderr: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(stderr).trim().to_string();
+    if detail.is_empty() {
+        format!("{shell} did not report any error details")
+    } else {
+        format!("{shell}: {detail}")
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -331,35 +351,47 @@ fn download_webview2_bootstrapper(path: &Path) -> Result<(), String> {
         })?;
     }
 
-    let output = hidden_windows_command("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!(
-                "$ErrorActionPreference = 'Stop'; \
-                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
-                 Invoke-WebRequest -UseBasicParsing -Uri '{}' -OutFile '{}'",
-                WEBVIEW2_BOOTSTRAPPER_URL,
-                path.display().to_string().replace('\'', "''")
-            ),
-        ])
-        .output()
-        .map_err(|e| format!("failed to start PowerShell to download WebView2 Runtime: {e}"))?;
+    let mut errors = Vec::new();
 
-    if output.status.success() && path.exists() {
-        return Ok(());
+    for shell in ["powershell.exe", "pwsh.exe"] {
+        let output = match hidden_windows_command(shell)
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &format!(
+                    "$ErrorActionPreference = 'Stop'; \
+                     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+                     Invoke-WebRequest -UseBasicParsing -Uri '{}' -OutFile '{}'",
+                    WEBVIEW2_BOOTSTRAPPER_URL,
+                    path.display().to_string().replace('\'', "''")
+                ),
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                errors.push(format!("{shell} was not found"));
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!("failed to start {shell}: {error}"));
+                continue;
+            }
+        };
+
+        if output.status.success() && path.exists() {
+            return Ok(());
+        }
+
+        errors.push(powershell_download_error(shell, &output.stderr));
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        Err("PowerShell did not download the WebView2 Runtime bootstrapper".to_string())
-    } else {
-        Err(format!(
-            "PowerShell failed to download the WebView2 Runtime bootstrapper: {stderr}"
-        ))
-    }
+    Err(format!(
+        "failed to download the WebView2 Runtime bootstrapper. {}",
+        errors.join(" | ")
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -372,12 +404,19 @@ fn install_webview2_runtime() -> Result<(), String> {
         .status()
         .map_err(|e| format!("failed to start WebView2 Runtime installer: {e}"))?;
 
-    if status.success() || wait_for_webview2_runtime(Duration::from_secs(10)) {
+    if !status.success() {
+        return Err(format!(
+            "WebView2 Runtime installer exited with status: {status}"
+        ));
+    }
+
+    if wait_for_webview2_runtime(WEBVIEW2_INSTALL_TIMEOUT) {
         return Ok(());
     }
 
     Err(format!(
-        "WebView2 Runtime installer exited with status: {status}"
+        "WebView2 Runtime installer finished, but WebView2 was still not detected after waiting {} seconds",
+        WEBVIEW2_INSTALL_TIMEOUT.as_secs()
     ))
 }
 
@@ -419,7 +458,7 @@ fn ensure_webview2_runtime_before_launch() -> Result<(), String> {
     show_webview2_installing_dialog();
     install_webview2_runtime()?;
 
-    if wait_for_webview2_runtime(Duration::from_secs(10)) {
+    if wait_for_webview2_runtime(WEBVIEW2_INSTALL_TIMEOUT) {
         Ok(())
     } else {
         Err("WebView2 Runtime installation finished, but the runtime was still not detected in the registry".to_string())
@@ -481,21 +520,7 @@ fn executable_filename(command: &str) -> String {
     }
 }
 
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-fn embedded_windows_sidecar_bytes(command: &str) -> Option<&'static [u8]> {
-    match command {
-        "ffmpeg" => Some(include_bytes!("../bin/ffmpeg-x86_64-pc-windows-msvc.exe")),
-        "sqlcipher" => Some(include_bytes!(
-            "../bin/sqlcipher-x86_64-pc-windows-msvc.exe"
-        )),
-        _ => None,
-    }
-}
-
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-fn embedded_windows_sidecar_bytes(_command: &str) -> Option<&'static [u8]> {
-    None
-}
+include!(concat!(env!("OUT_DIR"), "/embedded_windows_sidecars.rs"));
 
 fn embedded_windows_sidecar_path(command: &str) -> Option<PathBuf> {
     let bytes = embedded_windows_sidecar_bytes(command)?;
@@ -519,7 +544,15 @@ fn embedded_windows_sidecar_path(command: &str) -> Option<PathBuf> {
 }
 
 fn embedded_windows_sidecar_root() -> PathBuf {
-    env::temp_dir().join("rekordport-sidecars")
+    #[cfg(target_os = "windows")]
+    {
+        return runtime_support_root("sidecars");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        env::temp_dir().join("rekordport-sidecars")
+    }
 }
 
 fn candidate_search_roots() -> Vec<PathBuf> {

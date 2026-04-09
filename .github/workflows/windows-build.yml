@@ -61,6 +61,28 @@ jobs:
           "exe_path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "exe_name=$($exe.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
+      - name: Smoke test portable executable
+        shell: pwsh
+        run: |
+          $exe = "${{ steps.portable.outputs.exe_path }}"
+          $proc = $null
+
+          try {
+            $proc = Start-Process -FilePath $exe -PassThru
+            Start-Sleep -Seconds 10
+            $proc.Refresh()
+
+            if ($proc.HasExited) {
+              throw "Portable executable exited too early with code $($proc.ExitCode)."
+            }
+          }
+          finally {
+            if ($proc -and -not $proc.HasExited) {
+              Stop-Process -Id $proc.Id -Force
+              Wait-Process -Id $proc.Id -Timeout 10 -ErrorAction SilentlyContinue
+            }
+          }
+
       - name: Upload Windows portable executable artifact
         uses: actions/upload-artifact@v4
         with:
