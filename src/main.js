@@ -350,6 +350,11 @@ async function resolvePreviewPath(path) {
   return invoke("prepare_preview_path", { path });
 }
 
+function normalizePreviewAssetPath(path) {
+  const value = String(path || "");
+  return IS_WINDOWS ? value.replace(/\\/g, "/") : value;
+}
+
 function formatTime(value) {
   if (!Number.isFinite(value) || value < 0) return "0:00";
   const totalSeconds = Math.floor(value);
@@ -402,7 +407,7 @@ async function loadPreviewTrack(track, autoplay = true) {
   state.player.seeking = false;
   state.player.seekValue = 0;
   const playablePath = await resolvePreviewPath(track.full_path);
-  const src = convertFileSrc(playablePath);
+  const src = convertFileSrc(normalizePreviewAssetPath(playablePath));
   els.previewAudio.src = src;
   els.previewAudio.load();
   renderPlayer();
