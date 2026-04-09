@@ -1,5 +1,13 @@
 use super::*;
 
+fn normalize_path_separators(value: &str) -> String {
+    if cfg!(target_os = "windows") {
+        value.replace('/', "\\")
+    } else {
+        value.replace('\\', "/")
+    }
+}
+
 #[test]
 fn migrates_fixture_db_track_and_rebinds_standard_playlist() {
     if !command_available("sqlcipher") {
@@ -303,8 +311,8 @@ VALUES
     )
     .expect("analysis path query should succeed");
     assert_eq!(
-        stored_analysis_path,
-        expected_analysis_file.to_string_lossy().to_string()
+        normalize_path_separators(&stored_analysis_path),
+        normalize_path_separators(&expected_analysis_file.to_string_lossy())
     );
 
     let stored_content_file = sqlcipher_required_value(
@@ -318,12 +326,12 @@ VALUES
     )
     .expect("contentFile query should succeed");
     assert_eq!(
-        stored_content_file,
-        format!(
+        normalize_path_separators(&stored_content_file),
+        normalize_path_separators(&format!(
             "{}|{}|{}",
             expected_analysis_file.to_string_lossy(),
             expected_analysis_file.to_string_lossy(),
             new_content_uuid
-        )
+        ))
     );
 }

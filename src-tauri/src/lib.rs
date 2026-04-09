@@ -3135,6 +3135,14 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn normalize_path_separators(value: &str) -> String {
+        if cfg!(target_os = "windows") {
+            value.replace('/', "\\")
+        } else {
+            value.replace('\\', "/")
+        }
+    }
+
     #[test]
     fn parses_webview2_runtime_registry_version() {
         let output = format!(
@@ -3214,8 +3222,10 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
         );
 
         assert_eq!(
-            rewritten,
-            "D:/PIONEER/Master/share/PIONEER/USBANLZ/111/11111-2222-3333-4444-555555555555/ANLZ0000.2EX"
+            normalize_path_separators(&rewritten),
+            normalize_path_separators(
+                "D:/PIONEER/Master/share/PIONEER/USBANLZ/111/11111-2222-3333-4444-555555555555/ANLZ0000.2EX"
+            )
         );
     }
 
