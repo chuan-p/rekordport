@@ -1,11 +1,20 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import appIcon from "../src-tauri/icons/128x128.png";
 import "./style.css";
 
 const DEFAULT_MIN_BIT_DEPTH = 16;
 const STORAGE_KEY = "rekordbox-lossless-scan-settings";
 const IS_MACOS = /\bMac OS X\b|\bMacintosh\b/.test(navigator.userAgent);
 const IS_WINDOWS = /\bWindows\b/.test(navigator.userAgent);
+const PROFILE = {
+  kicker: "About",
+  name: "rekordport",
+  handle: "@chuan_p",
+  url: "https://www.instagram.com/chuan_p/",
+  suffix: "with heavy use of Codex.",
+  year: "2026",
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -40,6 +49,9 @@ const state = {
     seekValue: 0,
   },
   settings: loadSettings(),
+  ui: {
+    profileOpen: false,
+  },
 };
 
 const els = {
@@ -70,6 +82,14 @@ const els = {
   playerSeek: $("player-seek"),
   playerCurrent: $("player-current"),
   playerTotal: $("player-total"),
+  profileTrigger: $("profile-trigger"),
+  profileBackdrop: $("profile-backdrop"),
+  profileCard: $("profile-card"),
+  profileAvatarImage: $("profile-avatar-image"),
+  profileKicker: $("profile-kicker"),
+  profileName: $("profile-name"),
+  profileRole: $("profile-role"),
+  profileYear: $("profile-year"),
 };
 
 function loadSettings() {
@@ -183,6 +203,42 @@ function renderConvertButton() {
 
   els.convert.textContent = "Convert Selected";
   els.convert.disabled = selectedCount === 0 || state.loading || !convertReady;
+}
+
+function renderProfileCard() {
+  if (
+    !els.profileCard ||
+    !els.profileBackdrop ||
+    !els.profileTrigger ||
+    !els.profileAvatarImage ||
+    !els.profileKicker ||
+    !els.profileName ||
+    !els.profileRole ||
+    !els.profileYear
+  ) {
+    return;
+  }
+
+  els.profileAvatarImage.src = appIcon;
+  els.profileKicker.textContent = PROFILE.kicker;
+  els.profileName.textContent = PROFILE.name;
+  els.profileRole.innerHTML = `made by <a href="${escapeHtml(PROFILE.url)}" data-external-link="${escapeHtml(PROFILE.url)}">${escapeHtml(PROFILE.handle)}</a> ${escapeHtml(PROFILE.suffix)}`;
+  els.profileYear.textContent = PROFILE.year;
+
+  els.profileBackdrop.hidden = !state.ui.profileOpen;
+  els.profileCard.hidden = !state.ui.profileOpen;
+  els.profileTrigger.setAttribute("aria-expanded", String(state.ui.profileOpen));
+}
+
+function closeProfileCard() {
+  if (!state.ui.profileOpen) return;
+  state.ui.profileOpen = false;
+  renderProfileCard();
+}
+
+function toggleProfileCard() {
+  state.ui.profileOpen = !state.ui.profileOpen;
+  renderProfileCard();
 }
 
 function renderScanProgress() {
@@ -344,6 +400,10 @@ function formatAudioMeta(track) {
 
 async function openPathInFileManager(path) {
   await invoke("open_path_in_file_manager", { path });
+}
+
+async function openExternalUrl(url) {
+  await invoke("open_external_url", { url });
 }
 
 async function resolvePreviewPath(path) {
@@ -697,13 +757,7 @@ async function scan() {
     state.scanSummary = response.summary || null;
     state.selectedIds = new Set();
     state.conversionCompleted = false;
-    setStatus(
-      "Scanned",
-      response.summary?.candidate_total
-        ? `${formatNumber(response.summary.candidate_total)} candidates inspected`
-        : "",
-      "ready",
-    );
+    setStatus("Scanned", "", "ready");
     if (response.summary?.library_total) {
       const noteParts = [
         `Scanned ${formatNumber(response.summary.candidate_total || 0)} candidate tracks from ${formatNumber(response.summary.library_total)} library entries.`,
@@ -1013,12 +1067,41 @@ async function wireEvents() {
     state.player.seeking = false;
     renderPlayer();
   });
+  els.profileTrigger.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleProfileCard();
+  });
+  els.profileBackdrop.addEventListener("click", closeProfileCard);
+  els.profileCard.addEventListener("click", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+
+    const link = target.closest("a[data-external-link]");
+    if (!link) return;
+
+    event.preventDefault();
+    const url = link.dataset.externalLink;
+    if (!url) return;
+
+    try {
+      await openExternalUrl(url);
+    } catch (error) {
+      setStatus("Error", "", "error");
+      setError(`Could not open link: ${String(error)}`);
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeProfileCard();
+    }
+  });
 
 }
 
 function initialize() {
   document.documentElement.classList.toggle("platform-macos", IS_MACOS);
   normalizeSettings();
+  renderProfileCard();
   renderScanProgress();
   renderSummary();
   renderChips();

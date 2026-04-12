@@ -119,9 +119,39 @@
           <div class="export-progress-text" id="export-progress-text">Preparing conversion…</div>
         </div>
 
-        <div class="footer-note" id="footer-note">Checking local dependencies…</div>
+        <div class="footer-meta">
+          <div class="footer-note" id="footer-note">Checking local dependencies…</div>
+          <div class="profile-menu">
+            <button
+              class="ghost profile-trigger"
+              id="profile-trigger"
+              type="button"
+              aria-haspopup="dialog"
+              aria-expanded="false"
+              aria-controls="profile-card"
+              aria-label="About the developer"
+              title="About"
+            >
+              i
+            </button>
+          </div>
+        </div>
+
         <div class="footer-error" id="footer-error" hidden></div>
       </section>
     </main>
+
+    <div class="profile-backdrop" id="profile-backdrop" hidden></div>
+    <section class="profile-card" id="profile-card" hidden aria-label="Developer profile" aria-modal="true" role="dialog">
+      <div class="profile-card-avatar">
+        <img class="profile-card-avatar-image" id="profile-avatar-image" alt="rekordport app icon" />
+      </div>
+      <div class="profile-card-body">
+        <p class="profile-card-kicker" id="profile-kicker"></p>
+        <h3 id="profile-name"></h3>
+        <p class="profile-card-role" id="profile-role"></p>
+        <p class="profile-card-year" id="profile-year"></p>
+      </div>
+    </section>
   </body>
 </html>

@@ -239,6 +239,7 @@ struct AudioProbe {
     sample_rate: Option<u32>,
     channels: Option<u32>,
     bitrate_kbps: Option<u32>,
+    has_attached_pic: bool,
 }
 
 static COMMAND_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
@@ -1278,6 +1279,10 @@ fn parse_ffmpeg_audio_probe(text: &str) -> AudioProbe {
         channels: audio_line.and_then(parse_audio_channels),
         bitrate_kbps: parse_number_before_marker(probe_text, " kb/s")
             .or_else(|| parse_number_after_marker(text, "bitrate:")),
+        has_attached_pic: text.lines().any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("video:") && lower.contains("attached pic")
+        }),
     }
 }
 
@@ -1352,6 +1357,12 @@ struct ConversionSpec {
     ffmpeg_codec: &'static str,
     bit_depth: u32,
     bitrate_kbps: Option<u32>,
+}
+
+impl ConversionSpec {
+    fn supports_embedded_artwork(&self) -> bool {
+        matches!(self.extension, "mp3" | "m4a" | "aiff")
+    }
 }
 
 fn preset_spec(preset: &str) -> Result<ConversionSpec, String> {
@@ -2481,15 +2492,38 @@ fn convert_one_track(
     drop(temp_output);
 
     let conversion_result = (|| -> Result<(), String> {
+        let cover_art_supported = spec.supports_embedded_artwork();
+        let has_attached_pic = if cover_art_supported {
+            probe_audio(&archive_path)?.has_attached_pic
+        } else {
+            false
+        };
+
         let mut ffmpeg = prepared_command("ffmpeg")?;
         ffmpeg.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
         ffmpeg.arg(&archive_path);
-        ffmpeg.args(["-vn", "-map_metadata", "0", "-c:a", spec.ffmpeg_codec]);
+        ffmpeg.args(["-map", "0:a:0", "-map_metadata", "0", "-c:a", spec.ffmpeg_codec]);
+        if has_attached_pic {
+            ffmpeg.args([
+                "-map",
+                "0:v:0?",
+                "-c:v",
+                "png",
+                "-disposition:v:0",
+                "attached_pic",
+            ]);
+        }
+        if spec.extension == "wav" {
+            ffmpeg.arg("-vn");
+        }
         if spec.extension == "wav" || spec.extension == "aiff" || spec.extension == "m4a" {
             ffmpeg.args(["-ar", &target_sample_rate.to_string()]);
         }
         if let Some(bitrate) = spec.bitrate_kbps {
             ffmpeg.args(["-b:a", &format!("{bitrate}k")]);
+        }
+        if spec.extension == "aiff" {
+            ffmpeg.args(["-write_id3v2", "1", "-id3v2_version", "3"]);
         }
         if spec.extension == "m4a" {
             ffmpeg.args(["-movflags", "+faststart"]);
@@ -3262,6 +3296,53 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err(format!("unsupported url: {trimmed}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .arg(trimmed)
+            .status()
+            .map_err(|e| e.to_string())?;
+
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("failed to open url: {trimmed}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("explorer")
+            .arg(trimmed)
+            .status()
+            .map_err(|e| e.to_string())?;
+
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("failed to open url: {trimmed}"));
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let status = Command::new("xdg-open")
+            .arg(trimmed)
+            .status()
+            .map_err(|e| e.to_string())?;
+
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("failed to open url: {trimmed}"));
+    }
+}
+
+#[tauri::command]
 async fn scan_library(app: tauri::AppHandle, req: ScanRequest) -> Result<ScanResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
         scan_impl_with_progress(req, |payload| {
@@ -3336,6 +3417,7 @@ pub fn run() {
             pick_export_path,
             prepare_preview_path,
             open_path_in_file_manager,
+            open_external_url,
             scan_library,
             export_tracks,
             rekordbox_process_running,
@@ -3458,6 +3540,16 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
         assert_eq!(probe.sample_rate, Some(44_100));
         assert_eq!(probe.channels, Some(2));
         assert_eq!(probe.bitrate_kbps, Some(1411));
+    }
+
+    #[test]
+    fn detects_attached_picture_in_ffmpeg_probe() {
+        let probe = parse_ffmpeg_audio_probe(
+            "Input #0, flac, from 'song.flac':\n  Metadata:\n    title           : demo\n  Stream #0:0: Audio: flac, 44100 Hz, stereo, s16\n  Stream #0:1: Video: png, rgb24(pc), 600x600, 90k tbr, 90k tbn (attached pic)",
+        );
+
+        assert!(probe.has_attached_pic);
+        assert_eq!(probe.sample_rate, Some(44_100));
     }
 
     #[test]

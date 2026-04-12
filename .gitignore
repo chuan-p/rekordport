@@ -8,9 +8,12 @@ __pycache__/
 .env.*
 release/windows-x64-portable/
 release/*-portable.zip
+release/*.zip
 release/rekordport.exe
 release/*-setup.exe
 release/*.exe.zip
+release/*.dmg
+release/*.msi
 src-tauri/target/
 src-tauri/gen/
 src-tauri/tauri.generated.conf.json
