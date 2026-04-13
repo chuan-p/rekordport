@@ -9,6 +9,7 @@ __pycache__/
 release/windows-x64-portable/
 release/*-portable.zip
 release/*.zip
+release/*.exe
 release/rekordport.exe
 release/*-setup.exe
 release/*.exe.zip

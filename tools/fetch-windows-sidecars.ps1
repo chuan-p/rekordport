@@ -13,26 +13,31 @@ $targetTriple = if ($env:RKB_WINDOWS_TARGET_TRIPLE) {
   "x86_64-pc-windows-msvc"
 }
 
-$ffmpegTargetName = switch ($targetTriple) {
-  "aarch64-pc-windows-msvc" { "winarm64" }
-  "x86_64-pc-windows-msvc" { "win64" }
-  default { throw "Unsupported Windows target triple: $targetTriple" }
+$allowUnverifiedDownloads = $env:RKB_ALLOW_UNVERIFIED_DOWNLOADS -eq "1"
+
+$pinnedFfmpeg = @{
+  "x86_64-pc-windows-msvc" = @{
+    Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-11-14-07/ffmpeg-n8.1-7-ga3475e2554-win64-lgpl-8.1.zip"
+    Sha256 = "ff1e1cd3b015607430b936354478eef3ccb92a68a43e4b5ed2e1634e273e44a5"
+    Label = "BtbN FFmpeg win64 LGPL 8.1"
+  }
+  "aarch64-pc-windows-msvc" = @{
+    Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-11-14-07/ffmpeg-n8.1-7-ga3475e2554-winarm64-lgpl-8.1.zip"
+    Sha256 = "ad048f010d67f9b80c2c3fb1aab3fe94467e97c9070321c3dd978a9c5249cc74"
+    Label = "BtbN FFmpeg winarm64 LGPL 8.1"
+  }
 }
 
-$ffmpegUrl = if ($env:RKB_FFMPEG_WINDOWS_URL) {
-  $env:RKB_FFMPEG_WINDOWS_URL
-} elseif ($env:RKB_FFMPEG_WINDOWS_DEFAULT_URL) {
-  $env:RKB_FFMPEG_WINDOWS_DEFAULT_URL
-} else {
-  "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-$ffmpegTargetName-lgpl.zip"
+$pinnedSqlcipher = @{
+  "x86_64-pc-windows-msvc" = @{
+    Url = "https://raw.githubusercontent.com/Katecca/sqlcipher-static-binary/b7cb2d5dc1b6baee00e153ffbac8c6703f89da88/windows/x86_64/sqlcipher.exe"
+    Sha256 = "19f16d2629adedc6ddc2aeebd2da165d61aa0d645a61d2de373396c04ad0031f"
+    Label = "Katecca SQLCipher win64 static binary"
+  }
 }
 
-$sqlcipherUrl = if ($env:RKB_SQLCIPHER_WINDOWS_URL) {
-  $env:RKB_SQLCIPHER_WINDOWS_URL
-} elseif ($targetTriple -eq "x86_64-pc-windows-msvc") {
-  "https://raw.githubusercontent.com/Katecca/sqlcipher-static-binary/master/windows/x86_64/sqlcipher.exe"
-} else {
-  $null
+if (-not $pinnedFfmpeg.ContainsKey($targetTriple)) {
+  throw "Unsupported Windows target triple: $targetTriple"
 }
 
 function New-CleanDirectory([string]$Path) {
@@ -64,28 +69,75 @@ function Copy-RequiredTool([string]$SourcePath, [string]$TargetName) {
   Write-Host "Prepared $targetPath"
 }
 
+function Resolve-DownloadSpec(
+  [hashtable]$PinnedSpecs,
+  [string]$TargetTriple,
+  [string]$UrlEnvName,
+  [string]$ShaEnvName,
+  [string]$ToolLabel
+) {
+  $pinned = $null
+  if ($PinnedSpecs.ContainsKey($TargetTriple)) {
+    $pinned = $PinnedSpecs[$TargetTriple]
+  }
+
+  $url = [Environment]::GetEnvironmentVariable($UrlEnvName)
+  $sha = [Environment]::GetEnvironmentVariable($ShaEnvName)
+
+  if ([string]::IsNullOrWhiteSpace($url)) {
+    if ($null -eq $pinned) {
+      return $null
+    }
+    $url = $pinned.Url
+  }
+
+  if ([string]::IsNullOrWhiteSpace($sha)) {
+    if ($null -ne $pinned -and $url -eq $pinned.Url) {
+      $sha = $pinned.Sha256
+    } elseif (-not $allowUnverifiedDownloads) {
+      throw "Set $ShaEnvName when overriding $UrlEnvName for $ToolLabel, or set RKB_ALLOW_UNVERIFIED_DOWNLOADS=1 to bypass verification."
+    } else {
+      Write-Warning "Skipping SHA256 verification for $ToolLabel because RKB_ALLOW_UNVERIFIED_DOWNLOADS=1."
+    }
+  }
+
+  $resolvedLabel = $ToolLabel
+  if ($null -ne $pinned) {
+    $resolvedLabel = $pinned.Label
+  }
+
+  return @{
+    Url = $url
+    Sha256 = $sha
+    Label = $resolvedLabel
+  }
+}
+
 New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 New-CleanDirectory $tempRoot
 New-CleanDirectory $ffmpegExtractDir
 
-Invoke-Download $ffmpegUrl $ffmpegZip
-Assert-OptionalSha256 $ffmpegZip $env:RKB_FFMPEG_WINDOWS_SHA256 "ffmpeg archive"
+$ffmpegSpec = Resolve-DownloadSpec $pinnedFfmpeg $targetTriple "RKB_FFMPEG_WINDOWS_URL" "RKB_FFMPEG_WINDOWS_SHA256" "ffmpeg archive"
+Invoke-Download $ffmpegSpec.Url $ffmpegZip
+Assert-OptionalSha256 $ffmpegZip $ffmpegSpec.Sha256 $ffmpegSpec.Label
 Expand-Archive -LiteralPath $ffmpegZip -DestinationPath $ffmpegExtractDir -Force
 
 $ffmpegExe = Get-ChildItem -Path $ffmpegExtractDir -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1
 
 if (-not $ffmpegExe) {
-  throw "ffmpeg.exe was not found in $ffmpegUrl"
+  throw "ffmpeg.exe was not found in $($ffmpegSpec.Url)"
 }
 
 Copy-RequiredTool $ffmpegExe.FullName "ffmpeg-$targetTriple.exe"
 
-if ([string]::IsNullOrWhiteSpace($sqlcipherUrl)) {
-  throw "No default sqlcipher download is configured for $targetTriple. Set RKB_SQLCIPHER_WINDOWS_URL or place sqlcipher-$targetTriple.exe in src-tauri/bin."
+$sqlcipherSpec = Resolve-DownloadSpec $pinnedSqlcipher $targetTriple "RKB_SQLCIPHER_WINDOWS_URL" "RKB_SQLCIPHER_WINDOWS_SHA256" "sqlcipher binary"
+
+if ($null -eq $sqlcipherSpec) {
+  throw "No default sqlcipher download is configured for $targetTriple. Set RKB_SQLCIPHER_WINDOWS_URL and RKB_SQLCIPHER_WINDOWS_SHA256, or place sqlcipher-$targetTriple.exe in src-tauri/bin."
 }
 
-Invoke-Download $sqlcipherUrl $sqlcipherTemp
-Assert-OptionalSha256 $sqlcipherTemp $env:RKB_SQLCIPHER_WINDOWS_SHA256 "sqlcipher binary"
+Invoke-Download $sqlcipherSpec.Url $sqlcipherTemp
+Assert-OptionalSha256 $sqlcipherTemp $sqlcipherSpec.Sha256 $sqlcipherSpec.Label
 Copy-RequiredTool $sqlcipherTemp "sqlcipher-$targetTriple.exe"
 
 Write-Host "Windows sidecars are ready in $binDir"

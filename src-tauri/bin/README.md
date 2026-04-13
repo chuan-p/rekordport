@@ -48,5 +48,6 @@ Tauri `externalBin` 已经配置为：
 
 - `M4A 320kbps` 仍然依赖 ffmpeg 里存在 `aac_at` 编码器，通常只有 macOS 上的 ffmpeg 才会带这个能力。
 - 不建议把大二进制直接提交进仓库；可以在本地或 CI 里按平台放进这个目录再打包。
+- Windows 上建议优先用 [tools/fetch-windows-sidecars.ps1](../../tools/fetch-windows-sidecars.ps1) 拉取固定版本并校验 SHA-256，而不是依赖 `latest` 下载链接。
 - macOS 上如果这里放的是 Homebrew 的 `sqlcipher` / `ffmpeg` 符号链接，也可以参与构建；预处理脚本会复制真实二进制并把非系统动态库一起打包。
-- Apple Silicon 这组 sidecar 目前建议用 [tools/build-macos13-arm64-sidecars.sh](/Users/chuanpeng/Documents/rkb-lossless-process/tools/build-macos13-arm64-sidecars.sh) 生成，默认把最低系统版本压到 macOS 13.0，并保留 `aac_at` / `libmp3lame`。
+- Apple Silicon 这组 sidecar 目前建议用 [tools/build-macos13-arm64-sidecars.sh](../../tools/build-macos13-arm64-sidecars.sh) 生成，默认把最低系统版本压到 macOS 13.0，并保留 `aac_at` / `libmp3lame`。

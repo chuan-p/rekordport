@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest an improvement to the app, conversion flow, or developer experience
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing an idea.
+
+        Clear problem statements are especially helpful because this project
+        touches media conversion, metadata migration, and release packaging.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      placeholder: I need to ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: It would help if rekordport could ...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: Current workaround or another approach you considered
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Expected impact
+      options:
+        - Small quality-of-life improvement
+        - Useful workflow improvement
+        - Major capability gap
+        - Release / packaging improvement
+        - Documentation improvement
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Mockups, examples, prior art, or edge cases

@@ -1,21 +1,30 @@
 from __future__ import annotations
 
+from argparse import ArgumentParser
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
 
 
-SOURCE_IMAGE = Path(
-    "/Users/chuanpeng/Library/Containers/com.tencent.xinWeChat/Data/Documents/"
-    "xwechat_files/wxid_8k8it2sd0rp612_2393/temp/RWTemp/2026-04/"
-    "83cfb3b5b629bd84046f82d25b165edb/253fe67370fa04ad79537d71ec01f342.png"
-)
-OUTPUT_DIR = Path("/Users/chuanpeng/Documents/rkb-lossless-process/release/icon-drafts")
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "release" / "icon-drafts"
 CANVAS_SIZE = 1024
 BACKGROUND = (239, 232, 220, 255)
 GLYPH = (18, 14, 13, 255)
 APP_BACKGROUND = (28, 28, 31, 255)
 APP_GLYPH = (242, 243, 245, 255)
+
+
+def parse_args() -> tuple[Path, Path]:
+    parser = ArgumentParser(description="Generate flat icon drafts from a PNG with alpha.")
+    parser.add_argument("source_image", type=Path, help="Path to the source image.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory where the generated assets will be written.",
+    )
+    args = parser.parse_args()
+    return args.source_image.expanduser().resolve(), args.output_dir.expanduser().resolve()
 
 
 def smooth_alpha(alpha: Image.Image) -> Image.Image:
@@ -74,7 +83,8 @@ def rounded_background_with_color(
 
 
 def main() -> None:
-    source = Image.open(SOURCE_IMAGE).convert("RGBA")
+    source_image, output_dir = parse_args()
+    source = Image.open(source_image).convert("RGBA")
     alpha = source.getchannel("A")
     alpha = smooth_alpha(alpha)
     alpha = fit_alpha(alpha)
@@ -84,26 +94,26 @@ def main() -> None:
     glyph.putalpha(alpha)
     final = Image.alpha_composite(bg, glyph)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    final.save(OUTPUT_DIR / "app-icon-flat-1024.png")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    final.save(output_dir / "app-icon-flat-1024.png")
 
     app_bg = rounded_background_with_color(CANVAS_SIZE, APP_BACKGROUND)
     app_glyph = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), APP_GLYPH)
     app_glyph.putalpha(alpha)
     app_final = Image.alpha_composite(app_bg, app_glyph)
-    app_final.save(OUTPUT_DIR / "app-icon-flat-app-tone-1024.png")
+    app_final.save(output_dir / "app-icon-flat-app-tone-1024.png")
 
     transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
     clean_glyph = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), GLYPH)
     clean_glyph.putalpha(alpha)
     transparent = Image.alpha_composite(transparent, clean_glyph)
-    transparent.save(OUTPUT_DIR / "glyph-flat-smooth-1024.png")
+    transparent.save(output_dir / "glyph-flat-smooth-1024.png")
 
     app_transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
     app_clean_glyph = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), APP_GLYPH)
     app_clean_glyph.putalpha(alpha)
     app_transparent = Image.alpha_composite(app_transparent, app_clean_glyph)
-    app_transparent.save(OUTPUT_DIR / "glyph-flat-app-tone-1024.png")
+    app_transparent.save(output_dir / "glyph-flat-app-tone-1024.png")
 
 
 if __name__ == "__main__":

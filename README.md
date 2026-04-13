@@ -2,14 +2,14 @@
 
 ![rekordport icon](src-tauri/icons/128x128.png)
 
-Desktop utility for scanning a Rekordbox library, finding lossless or high-bit-depth tracks, and converting selected entries while updating Rekordbox metadata.
+Desktop utility for scanning a Rekordbox library, finding lossless or high-resolution tracks, and converting selected entries while updating Rekordbox metadata.
 
 ## What It Does
 
 - Scans `master.db` for:
   - FLAC
   - ALAC
-  - WAV / AIFF above 16-bit
+  - WAV / AIFF above 16-bit or above 48kHz
 - Lets you preview results in a desktop UI
 - Converts selected tracks to `WAV`, `AIFF`, `MP3 320kbps`, or `M4A 320kbps`
 - Backs up the source file and database before conversion
@@ -96,6 +96,13 @@ The app looks for conversion dependencies in this order:
 
 See [src-tauri/bin/README.md](src-tauri/bin/README.md) for sidecar naming and packaging notes.
 
+## Open Source Project Health
+
+- Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- Security reporting: [SECURITY.md](SECURITY.md)
+- Third-party build notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+
 ## Format Notes
 
 - `M4A 320kbps` requires the Apple `aac_at` encoder and is usually only available on macOS.
@@ -120,7 +127,19 @@ npm ci
 npm run tauri build -- --bundles nsis
 ```
 
-The helper script [tools/fetch-windows-sidecars.ps1](tools/fetch-windows-sidecars.ps1) can download default Windows sidecars for `ffmpeg` and `sqlcipher`.
+The helper script [tools/fetch-windows-sidecars.ps1](tools/fetch-windows-sidecars.ps1) downloads pinned Windows sidecars for `ffmpeg` and `sqlcipher` and verifies SHA-256 digests by default.
+
+If you override the upstream URLs, also provide matching hashes:
+
+```powershell
+$env:RKB_FFMPEG_WINDOWS_URL = "https://example.invalid/ffmpeg.zip"
+$env:RKB_FFMPEG_WINDOWS_SHA256 = "<sha256>"
+$env:RKB_SQLCIPHER_WINDOWS_URL = "https://example.invalid/sqlcipher.exe"
+$env:RKB_SQLCIPHER_WINDOWS_SHA256 = "<sha256>"
+./tools/fetch-windows-sidecars.ps1
+```
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the currently pinned artifacts.
 
 ## Repository Layout
 
@@ -131,7 +150,7 @@ The helper script [tools/fetch-windows-sidecars.ps1](tools/fetch-windows-sidecar
 
 ## Contributing
 
-Small bug reports, platform notes, and focused pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
+Small bug reports, platform notes, and focused pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), use the GitHub issue templates for bugs and feature requests, and check [SECURITY.md](SECURITY.md) before reporting sensitive issues.
 
 ## License
 

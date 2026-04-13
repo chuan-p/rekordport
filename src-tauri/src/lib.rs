@@ -24,6 +24,7 @@ mod migration_fixture_tests;
 mod process;
 
 const DEFAULT_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
+const HI_RES_SAMPLE_RATE_THRESHOLD: u32 = 48_000;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -861,12 +862,25 @@ fn ensure_preview_transcode(source: &Path) -> Result<PathBuf, String> {
     let mut ffmpeg = prepared_command("ffmpeg")?;
     ffmpeg.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
     ffmpeg.arg(source);
-    ffmpeg.args(["-vn", "-ac", "2", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "192k"]);
+    ffmpeg.args([
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
+        "44100",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+    ]);
     ffmpeg.arg(&cached);
 
     let output = ffmpeg.output().map_err(|e| {
         io_error_message(
-            &format!("failed to run ffmpeg while preparing preview for {}", source.display()),
+            &format!(
+                "failed to run ffmpeg while preparing preview for {}",
+                source.display()
+            ),
             &e,
         )
     })?;
@@ -1529,7 +1543,7 @@ fn build_scan_query(min_bit_depth: u32, include_sampler: bool) -> String {
     };
 
     format!(
-        ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 6\n    OR (c.FileType IN (11, 12) AND COALESCE(c.BitDepth, 0) > {min_bit_depth})\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
+        ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 6\n    OR (\n      c.FileType IN (11, 12)\n      AND (\n        COALESCE(c.BitDepth, 0) > {min_bit_depth}\n        OR COALESCE(c.SampleRate, 0) > {HI_RES_SAMPLE_RATE_THRESHOLD}\n      )\n    )\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
     )
 }
 
@@ -2502,7 +2516,14 @@ fn convert_one_track(
         let mut ffmpeg = prepared_command("ffmpeg")?;
         ffmpeg.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
         ffmpeg.arg(&archive_path);
-        ffmpeg.args(["-map", "0:a:0", "-map_metadata", "0", "-c:a", spec.ffmpeg_codec]);
+        ffmpeg.args([
+            "-map",
+            "0:a:0",
+            "-map_metadata",
+            "0",
+            "-c:a",
+            spec.ffmpeg_codec,
+        ]);
         if has_attached_pic {
             ffmpeg.args([
                 "-map",
@@ -3442,7 +3463,9 @@ mod tests {
     #[test]
     fn normalizes_windows_path_strings() {
         assert_eq!(
-            normalize_windows_path_string(r"D:/Music/Other\2 Unlimited,Remo-Conv - Twilight Zone.aiff"),
+            normalize_windows_path_string(
+                r"D:/Music/Other\2 Unlimited,Remo-Conv - Twilight Zone.aiff"
+            ),
             r"D:\Music\Other\2 Unlimited,Remo-Conv - Twilight Zone.aiff"
         );
         assert_eq!(
@@ -3620,7 +3643,8 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
     #[test]
     #[ignore]
     fn migrate_real_master_db_track() {
-        let db_path = "/Users/chuanpeng/Library/Pioneer/rekordbox/master.db".to_string();
+        let db_path = env::var("RKB_REAL_MASTER_DB_PATH")
+            .expect("set RKB_REAL_MASTER_DB_PATH to run this ignored test");
         let scan = scan_impl(ScanRequest {
             db_path: db_path.clone(),
             min_bit_depth: 16,

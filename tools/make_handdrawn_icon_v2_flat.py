@@ -1,22 +1,31 @@
 from __future__ import annotations
 
+from argparse import ArgumentParser
 from collections import deque
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
 
 
-SOURCE_IMAGE = Path(
-    "/Users/chuanpeng/Library/Containers/com.tencent.xinWeChat/Data/Documents/"
-    "xwechat_files/wxid_8k8it2sd0rp612_2393/temp/RWTemp/2026-04/"
-    "83cfb3b5b629bd84046f82d25b165edb/766b4fb0bf6b1124e5ee1addd14d1170.jpg"
-)
-OUTPUT_DIR = Path("/Users/chuanpeng/Documents/rkb-lossless-process/release/icon-drafts")
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "release" / "icon-drafts"
 CANVAS_SIZE = 1024
 APP_BACKGROUND = (28, 28, 31, 255)
 APP_GLYPH = (242, 243, 245, 255)
 LIGHT_BACKGROUND = (246, 246, 243, 255)
 LIGHT_GLYPH = (95, 96, 99, 255)
+
+
+def parse_args() -> tuple[Path, Path]:
+    parser = ArgumentParser(description="Generate refined hand-drawn flat icon drafts.")
+    parser.add_argument("source_image", type=Path, help="Path to the source image.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory where the generated assets will be written.",
+    )
+    args = parser.parse_args()
+    return args.source_image.expanduser().resolve(), args.output_dir.expanduser().resolve()
 
 
 def extract_mask(image: Image.Image, threshold: int = 84) -> Image.Image:
@@ -133,36 +142,37 @@ def rounded_background(size: int, color: tuple[int, int, int, int], radius: int 
 
 
 def main() -> None:
-    image = Image.open(SOURCE_IMAGE).convert("RGB")
+    source_image, output_dir = parse_args()
+    image = Image.open(source_image).convert("RGB")
     alpha = extract_mask(image)
     alpha = smooth_alpha(alpha)
     alpha = fit_alpha(alpha)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     bg = rounded_background(CANVAS_SIZE, APP_BACKGROUND)
     glyph = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), APP_GLYPH)
     glyph.putalpha(alpha)
     final = Image.alpha_composite(bg, glyph)
-    final.save(OUTPUT_DIR / "app-icon-flat-app-tone-v2-1024.png")
+    final.save(output_dir / "app-icon-flat-app-tone-v2-1024.png")
 
     light_bg = rounded_background(CANVAS_SIZE, LIGHT_BACKGROUND)
     light_glyph = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), LIGHT_GLYPH)
     light_glyph.putalpha(alpha)
     light_final = Image.alpha_composite(light_bg, light_glyph)
-    light_final.save(OUTPUT_DIR / "app-icon-flat-light-v2-1024.png")
+    light_final.save(output_dir / "app-icon-flat-light-v2-1024.png")
 
     transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
     plain = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), APP_GLYPH)
     plain.putalpha(alpha)
     transparent = Image.alpha_composite(transparent, plain)
-    transparent.save(OUTPUT_DIR / "glyph-flat-app-tone-v2-1024.png")
+    transparent.save(output_dir / "glyph-flat-app-tone-v2-1024.png")
 
     light_transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
     light_plain = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), LIGHT_GLYPH)
     light_plain.putalpha(alpha)
     light_transparent = Image.alpha_composite(light_transparent, light_plain)
-    light_transparent.save(OUTPUT_DIR / "glyph-flat-light-v2-1024.png")
+    light_transparent.save(output_dir / "glyph-flat-light-v2-1024.png")
 
 
 if __name__ == "__main__":

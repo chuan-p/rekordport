@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan a Rekordbox master.db for FLAC, ALAC, and high-bit-depth WAV/AIFF tracks.
+"""Scan a Rekordbox master.db for FLAC, ALAC, and high-res WAV/AIFF tracks.
 
 This script reads the encrypted Rekordbox 6 master database through the
 `sqlcipher` CLI, so it does not need any Python SQLCipher bindings.
@@ -34,6 +34,7 @@ def default_db_path() -> Path:
 
 DEFAULT_DB_PATH = default_db_path()
 DEFAULT_KEY = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497"
+HI_RES_SAMPLE_RATE_THRESHOLD = 48_000
 
 FILE_TYPE_NAMES = {
     4: "M4A",
@@ -73,7 +74,7 @@ class Track:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Find FLAC, ALAC, and WAV/AIFF tracks with bit depth greater than 16 in Rekordbox."
+        description="Find FLAC, ALAC, and WAV/AIFF tracks with bit depth greater than 16 or sample rate above 48kHz in Rekordbox."
     )
     parser.add_argument(
         "--db",
@@ -141,7 +142,13 @@ WHERE
   (
     c.FileType = 5
     OR c.FileType = 6
-    OR (c.FileType IN (11, 12) AND COALESCE(c.BitDepth, 0) > {min_bit_depth})
+    OR (
+      c.FileType IN (11, 12)
+      AND (
+        COALESCE(c.BitDepth, 0) > {min_bit_depth}
+        OR COALESCE(c.SampleRate, 0) > {HI_RES_SAMPLE_RATE_THRESHOLD}
+      )
+    )
   )
 {sampler_filter}ORDER BY
   artist COLLATE NOCASE,

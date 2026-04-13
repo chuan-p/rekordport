@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from argparse import ArgumentParser
 from collections import deque
 from pathlib import Path
 import math
@@ -8,12 +9,20 @@ import random
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 
-SOURCE_IMAGE = Path(
-    "/Users/chuanpeng/Library/Containers/com.tencent.xinWeChat/Data/Documents/"
-    "xwechat_files/wxid_8k8it2sd0rp612_2393/temp/RWTemp/2026-04/"
-    "83cfb3b5b629bd84046f82d25b165edb/8df212ab5d32ce5b52f28eb6247f57a0.jpg"
-)
-OUTPUT_DIR = Path("/Users/chuanpeng/Documents/rkb-lossless-process/release/icon-drafts")
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "release" / "icon-drafts"
+
+
+def parse_args() -> tuple[Path, Path]:
+    parser = ArgumentParser(description="Generate hand-drawn app icon drafts.")
+    parser.add_argument("source_image", type=Path, help="Path to the source image.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory where the generated assets will be written.",
+    )
+    args = parser.parse_args()
+    return args.source_image.expanduser().resolve(), args.output_dir.expanduser().resolve()
 
 
 def extract_main_shape_mask(image: Image.Image, threshold: int = 72) -> Image.Image:
@@ -229,15 +238,16 @@ def render_transparent_glyph(mask: Image.Image, out_path: Path) -> None:
 
 
 def main() -> None:
-    image = Image.open(SOURCE_IMAGE).convert("RGB")
+    source_image, output_dir = parse_args()
+    image = Image.open(source_image).convert("RGB")
     mask = extract_main_shape_mask(image)
     mask = fit_mask(mask, size=1024, target_ratio=0.58)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    render_clean_icon(mask, OUTPUT_DIR / "app-icon-clean-1024.png")
-    render_paper_icon(mask, OUTPUT_DIR / "app-icon-paper-1024.png")
-    render_dark_icon(mask, OUTPUT_DIR / "app-icon-dark-1024.png")
-    render_transparent_glyph(mask, OUTPUT_DIR / "glyph-transparent-1024.png")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    render_clean_icon(mask, output_dir / "app-icon-clean-1024.png")
+    render_paper_icon(mask, output_dir / "app-icon-paper-1024.png")
+    render_dark_icon(mask, output_dir / "app-icon-dark-1024.png")
+    render_transparent_glyph(mask, output_dir / "glyph-transparent-1024.png")
 
 
 if __name__ == "__main__":

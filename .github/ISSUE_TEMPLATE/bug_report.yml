@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a reproducible problem in the app, CLI, or build flow
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        Please include enough detail for someone else to reproduce it without
+        access to your local Rekordbox library.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      description: Which part of the project is affected?
+      options:
+        - Desktop app
+        - Python CLI
+        - Windows build / packaging
+        - macOS build / packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version or commit
+      description: A release tag, commit SHA, or branch name
+      placeholder: v0.1.0 or 0123abcd
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest set of steps that reproduces the issue
+      placeholder: |
+        1. Open the app
+        2. Select a Rekordbox database
+        3. Start a conversion with ...
+        4. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, or terminal output
+      description: Redact personal library paths or identifiers if needed
+      render: shell
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Rekordbox version, sample files, or anything else that may help
