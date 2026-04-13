@@ -3,6 +3,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from collections import deque
 from pathlib import Path
+import random
 
 from PIL import Image, ImageDraw, ImageFilter
 
@@ -13,6 +14,8 @@ APP_BACKGROUND = (28, 28, 31, 255)
 APP_GLYPH = (242, 243, 245, 255)
 LIGHT_BACKGROUND = (246, 246, 243, 255)
 LIGHT_GLYPH = (95, 96, 99, 255)
+REFERENCE_BACKGROUND = (228, 226, 214, 255)
+REFERENCE_GLYPH = (46, 44, 52, 255)
 
 
 def parse_args() -> tuple[Path, Path]:
@@ -33,7 +36,7 @@ def extract_mask(image: Image.Image, threshold: int = 84) -> Image.Image:
     width, height = gray.size
     pixels = gray.load()
     visited = bytearray(width * height)
-    chosen_points: list[tuple[int, int]] = []
+    components: list[dict[str, object]] = []
 
     for y in range(height):
         for x in range(width):
@@ -62,14 +65,62 @@ def extract_mask(image: Image.Image, threshold: int = 84) -> Image.Image:
                             visited[n_idx] = 1
                             queue.append((nx, ny))
 
-            if len(points) < 700:
-                continue
-            if max_y > 1000:
-                continue
-            chosen_points.extend(points)
+            components.append(
+                {
+                    "points": points,
+                    "bbox": (min_x, min_y, max_x, max_y),
+                    "count": len(points),
+                    "touches_edge": min_x == 0 or min_y == 0 or max_x == width - 1 or max_y == height - 1,
+                    "center": ((min_x + max_x) / 2, (min_y + max_y) / 2),
+                }
+            )
+
+    if not components:
+        raise RuntimeError("Failed to isolate the drawing from the photo.")
+
+    central_components = [
+        component
+        for component in components
+        if component["count"] >= 500
+        and not component["touches_edge"]
+        and width * 0.15 <= component["center"][0] <= width * 0.85
+        and height * 0.15 <= component["center"][1] <= height * 0.85
+    ]
+
+    if not central_components:
+        central_components = [component for component in components if component["count"] >= 500 and not component["touches_edge"]]
+
+    if not central_components:
+        raise RuntimeError("Failed to find a central drawing component.")
+
+    anchor = max(central_components, key=lambda component: component["count"])
+    anchor_min_x, anchor_min_y, anchor_max_x, anchor_max_y = anchor["bbox"]
+    anchor_width = anchor_max_x - anchor_min_x
+    anchor_height = anchor_max_y - anchor_min_y
+    expand_x = max(24, int(anchor_width * 0.42))
+    expand_y = max(24, int(anchor_height * 0.42))
+    selection_box = (
+        max(0, anchor_min_x - expand_x),
+        max(0, anchor_min_y - expand_y),
+        min(width, anchor_max_x + expand_x),
+        min(height, anchor_max_y + expand_y),
+    )
+
+    chosen_points: list[tuple[int, int]] = []
+    sel_min_x, sel_min_y, sel_max_x, sel_max_y = selection_box
+    for component in components:
+        comp_min_x, comp_min_y, comp_max_x, comp_max_y = component["bbox"]
+        intersects_selection = not (
+            comp_max_x < sel_min_x
+            or comp_min_x > sel_max_x
+            or comp_max_y < sel_min_y
+            or comp_min_y > sel_max_y
+        )
+        if component["count"] >= 120 and intersects_selection and not component["touches_edge"]:
+            chosen_points.extend(component["points"])
 
     if not chosen_points:
-        raise RuntimeError("Failed to isolate the drawing from the photo.")
+        chosen_points = list(anchor["points"])
 
     xs = [x for x, _ in chosen_points]
     ys = [y for _, y in chosen_points]
@@ -92,6 +143,16 @@ def extract_mask(image: Image.Image, threshold: int = 84) -> Image.Image:
         )
     )
     return cropped
+
+
+def load_source_alpha(image: Image.Image) -> Image.Image:
+    if "A" in image.getbands():
+        alpha = image.getchannel("A")
+        bbox = alpha.getbbox()
+        if bbox:
+            return alpha
+
+    return extract_mask(image)
 
 
 def smooth_alpha(alpha: Image.Image) -> Image.Image:
@@ -141,10 +202,34 @@ def rounded_background(size: int, color: tuple[int, int, int, int], radius: int 
     return base
 
 
+def add_paper_texture(
+    image: Image.Image,
+    seed: int = 11,
+    grain_strength: int = 18,
+    blur: float = 0.7,
+) -> Image.Image:
+    width, height = image.size
+    original_alpha = image.getchannel("A")
+    rng = random.Random(seed)
+    noise = Image.new("L", (width, height))
+    values = bytearray(width * height)
+    for i in range(width * height):
+        values[i] = max(0, min(255, 128 + rng.randint(-grain_strength, grain_strength)))
+    noise.frombytes(bytes(values))
+    noise = noise.filter(ImageFilter.GaussianBlur(blur))
+
+    texture = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+    alpha = noise.point(lambda p: max(0, min(40, abs(p - 128) // 2)))
+    texture.putalpha(alpha)
+    textured = Image.alpha_composite(image, texture)
+    textured.putalpha(original_alpha)
+    return textured
+
+
 def main() -> None:
     source_image, output_dir = parse_args()
-    image = Image.open(source_image).convert("RGB")
-    alpha = extract_mask(image)
+    image = Image.open(source_image)
+    alpha = load_source_alpha(image)
     alpha = smooth_alpha(alpha)
     alpha = fit_alpha(alpha)
 
@@ -162,6 +247,13 @@ def main() -> None:
     light_final = Image.alpha_composite(light_bg, light_glyph)
     light_final.save(output_dir / "app-icon-flat-light-v2-1024.png")
 
+    reference_bg = rounded_background(CANVAS_SIZE, REFERENCE_BACKGROUND)
+    reference_bg = add_paper_texture(reference_bg)
+    reference_glyph = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), REFERENCE_GLYPH)
+    reference_glyph.putalpha(alpha)
+    reference_final = Image.alpha_composite(reference_bg, reference_glyph)
+    reference_final.save(output_dir / "app-icon-reference-style-v1-1024.png")
+
     transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
     plain = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), APP_GLYPH)
     plain.putalpha(alpha)
@@ -173,6 +265,12 @@ def main() -> None:
     light_plain.putalpha(alpha)
     light_transparent = Image.alpha_composite(light_transparent, light_plain)
     light_transparent.save(output_dir / "glyph-flat-light-v2-1024.png")
+
+    reference_transparent = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), (0, 0, 0, 0))
+    reference_plain = Image.new("RGBA", (CANVAS_SIZE, CANVAS_SIZE), REFERENCE_GLYPH)
+    reference_plain.putalpha(alpha)
+    reference_transparent = Image.alpha_composite(reference_transparent, reference_plain)
+    reference_transparent.save(output_dir / "glyph-reference-style-v1-1024.png")
 
 
 if __name__ == "__main__":
