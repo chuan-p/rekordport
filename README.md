@@ -2,7 +2,7 @@
 
 ![rekordport icon](src-tauri/icons/128x128.png)
 
-Desktop utility for scanning a Rekordbox library, finding lossless or high-resolution tracks, and converting selected entries while updating Rekordbox metadata.
+A tool for scanning a rekordbox library, finding hi-res files CDJs don't support, and converting selected entries without losing rekordbox metadata. 
 
 ## What It Does
 
@@ -13,12 +13,12 @@ Desktop utility for scanning a Rekordbox library, finding lossless or high-resol
 - Lets you preview results in a desktop UI
 - Converts selected tracks to `WAV`, `AIFF`, `MP3 320kbps`, or `M4A 320kbps`
 - Backs up the source file and database before conversion
-- Rewrites Rekordbox paths and rebinds standard playlists to the new entry
-- Shows preflight warnings before you start changing anything
+- Rewrites rekordbox paths and rebinds standard playlists to the new entry
+
 
 ## Safety Notes
 
-- `rekordport` modifies your Rekordbox database during conversion.
+- `rekordport` modifies your rekordbox database during conversion.
 - The app creates backups first, but you should still keep your own library backup.
 - Smart playlists are not rewritten yet.
 - `MP3` and `M4A` now preserve embedded cover art when the source contains attached artwork.
@@ -107,12 +107,12 @@ See [src-tauri/bin/README.md](src-tauri/bin/README.md) for sidecar naming and pa
 
 - `M4A 320kbps` requires the Apple `aac_at` encoder and is usually only available on macOS.
 - The app uses `ffmpeg` for probing, preview generation, and conversion.
-- The app uses `sqlcipher` for direct Rekordbox database access.
+- The app uses `sqlcipher` for direct rekordbox database access.
 
 ## Current Limitations
 
 - Smart playlist migration is not implemented yet.
-- Rekordbox USB export behavior may still keep old files depending on Rekordbox's own sync rules.
+- rekordbox USB export behavior may still keep old files depending on rekordbox's own sync rules.
 - If analysis resources are already broken or inconsistent, conversion stops instead of trying to guess.
 - `WAV` cover art is not preserved.
 
