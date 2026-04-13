@@ -2,7 +2,9 @@
 
 ![rekordport icon](src-tauri/icons/128x128.png)
 
-A tool for scanning a rekordbox library, finding hi-res files CDJs don't support, and converting selected entries without losing rekordbox metadata. 
+A tool for scanning a rekordbox library, finding hi-res files CDJs don't support, and converting selected entries without losing rekordbox metadata.
+
+![rekordport desktop screenshot](docs/assets/readme-scan-preview.png)
 
 ## What It Does
 
