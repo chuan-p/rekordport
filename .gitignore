@@ -7,6 +7,7 @@ __pycache__/
 .env
 .env.*
 release/windows-x64-portable/
+release/icon-drafts/
 release/*-portable.zip
 release/*.zip
 release/*.exe
