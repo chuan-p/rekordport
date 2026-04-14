@@ -2,7 +2,7 @@
 name = "rekordport"
 version = "0.1.0"
 description = "rekordport desktop app"
-authors = ["chuanpeng"]
+authors = ["chuan"]
 edition = "2021"
 
 [lib]

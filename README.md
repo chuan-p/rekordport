@@ -1,10 +1,14 @@
 # rekordport
 
-![rekordport icon](src-tauri/icons/128x128.png)
+<p align="center">
+  <img src="src-tauri/icons/128x128.png" alt="rekordport icon" width="128" />
+</p>
 
-A tool for scanning a rekordbox library, finding hi-res files CDJs don't support, and converting selected entries without losing rekordbox metadata.
+rekordport is a tool for scanning a rekordbox library, finding hi-res files CDJs don't support, and converting selected entries without losing rekordbox metadata. Made by [chuan](https://www.instagram.com/chuan_p/) with heavy use of Codex.
 
-![rekordport desktop screenshot](docs/assets/readme-scan-preview.png)
+<p align="center">
+  <img src="docs/assets/readme-scan-preview.png" alt="rekordport desktop screenshot" />
+</p>
 
 ## What It Does
 
