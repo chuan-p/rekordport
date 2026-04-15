@@ -1,10 +1,19 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import appIcon from "../src-tauri/icons/128x128.png";
 import "./style.css";
 
 const DEFAULT_MIN_BIT_DEPTH = 16;
 const STORAGE_KEY = "rekordbox-lossless-scan-settings";
+const UPDATE_DISMISS_KEY = "rekordport-update-dismissed-version";
+const UPDATE_REPOSITORY = {
+  owner: "chuan-p",
+  repo: "rekordport",
+};
+const UPDATE_RELEASES_API_URL = `https://api.github.com/repos/${UPDATE_REPOSITORY.owner}/${UPDATE_REPOSITORY.repo}/releases/latest`;
+const UPDATE_RELEASES_PAGE_URL = `https://github.com/${UPDATE_REPOSITORY.owner}/${UPDATE_REPOSITORY.repo}/releases/latest`;
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const IS_MACOS = /\bMac OS X\b|\bMacintosh\b/.test(navigator.userAgent);
 const IS_WINDOWS = /\bWindows\b/.test(navigator.userAgent);
 const PROFILE = {
@@ -49,6 +58,19 @@ const state = {
     seekValue: 0,
   },
   settings: loadSettings(),
+  update: {
+    available: false,
+    checking: false,
+    currentVersion: "",
+    latestVersion: "",
+    releaseName: "",
+    releaseUrl: "",
+    publishedAt: "",
+    dismissedVersion: loadDismissedUpdateVersion(),
+    postponedVersion: "",
+    modalOpen: false,
+    timerId: null,
+  },
   ui: {
     profileOpen: false,
   },
@@ -63,6 +85,13 @@ const els = {
   exportProgress: $("export-progress"),
   exportProgressBar: $("export-progress-bar"),
   exportProgressText: $("export-progress-text"),
+  updateBackdrop: $("update-backdrop"),
+  updateDialog: $("update-dialog"),
+  updateTitle: $("update-title"),
+  updateMeta: $("update-meta"),
+  updateDownload: $("update-download"),
+  updateLater: $("update-later"),
+  updateDismiss: $("update-dismiss"),
   resultsCaption: $("results-caption"),
   resultsMeta: $("results-meta"),
   body: $("results-body"),
@@ -128,6 +157,237 @@ function normalizePreset(value) {
     default:
       return "wav-auto";
   }
+}
+
+function normalizeVersionTag(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^[vV]/, "");
+}
+
+function loadDismissedUpdateVersion() {
+  try {
+    return normalizeVersionTag(localStorage.getItem(UPDATE_DISMISS_KEY));
+  } catch {
+    return "";
+  }
+}
+
+function saveDismissedUpdateVersion(version) {
+  const normalized = normalizeVersionTag(version);
+  state.update.dismissedVersion = normalized;
+
+  try {
+    if (normalized) {
+      localStorage.setItem(UPDATE_DISMISS_KEY, normalized);
+    } else {
+      localStorage.removeItem(UPDATE_DISMISS_KEY);
+    }
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function parseVersion(value) {
+  const normalized = normalizeVersionTag(value);
+  if (!normalized.includes(".") && normalized.split("-").every((segment) => /^\d+$/.test(segment))) {
+    const core = normalized
+      .split("-")
+      .map((segment) => Number.parseInt(segment, 10))
+      .map((segment) => (Number.isFinite(segment) ? segment : 0));
+
+    while (core.length < 3) core.push(0);
+
+    return {
+      core,
+      prerelease: [],
+    };
+  }
+
+  const [corePart, ...prereleaseParts] = normalized.split("-");
+  const prereleasePart = prereleaseParts.join("-");
+  const core = corePart
+    .split(".")
+    .map((segment) => Number.parseInt(segment, 10))
+    .map((segment) => (Number.isFinite(segment) ? segment : 0));
+
+  while (core.length < 3) core.push(0);
+
+  return {
+    core,
+    prerelease: prereleasePart
+      ? prereleasePart.split(".").filter(Boolean)
+      : [],
+  };
+}
+
+function comparePrereleaseIdentifiers(left, right) {
+  const leftNumeric = /^\d+$/.test(left);
+  const rightNumeric = /^\d+$/.test(right);
+
+  if (leftNumeric && rightNumeric) {
+    return Number(left) - Number(right);
+  }
+
+  if (leftNumeric) return -1;
+  if (rightNumeric) return 1;
+  return left.localeCompare(right);
+}
+
+function compareVersions(left, right) {
+  const a = parseVersion(left);
+  const b = parseVersion(right);
+
+  for (let index = 0; index < Math.max(a.core.length, b.core.length); index += 1) {
+    const leftPart = a.core[index] ?? 0;
+    const rightPart = b.core[index] ?? 0;
+    if (leftPart !== rightPart) return leftPart - rightPart;
+  }
+
+  const aStable = a.prerelease.length === 0;
+  const bStable = b.prerelease.length === 0;
+  if (aStable && bStable) return 0;
+  if (aStable) return 1;
+  if (bStable) return -1;
+
+  for (let index = 0; index < Math.max(a.prerelease.length, b.prerelease.length); index += 1) {
+    const leftPart = a.prerelease[index];
+    const rightPart = b.prerelease[index];
+    if (leftPart == null) return -1;
+    if (rightPart == null) return 1;
+    const diff = comparePrereleaseIdentifiers(leftPart, rightPart);
+    if (diff !== 0) return diff;
+  }
+
+  return 0;
+}
+
+function formatReleaseDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+  }).format(date);
+}
+
+function renderUpdateModal() {
+  if (
+    !els.updateBackdrop ||
+    !els.updateDialog ||
+    !els.updateTitle ||
+    !els.updateMeta ||
+    !els.updateDownload ||
+    !els.updateLater ||
+    !els.updateDismiss
+  ) {
+    return;
+  }
+
+  const visible = Boolean(
+    state.update.available
+      && state.update.releaseUrl
+      && state.update.modalOpen,
+  );
+
+  els.updateBackdrop.hidden = !visible;
+  els.updateDialog.hidden = !visible;
+
+  if (!visible) {
+    els.updateMeta.textContent = "";
+    return;
+  }
+
+  const latestVersion = state.update.latestVersion || "new";
+  const currentVersion = state.update.currentVersion || "current";
+  const releaseDate = formatReleaseDate(state.update.publishedAt);
+  const metaParts = [
+    `Current version ${currentVersion}`,
+    releaseDate ? `Published ${releaseDate}` : null,
+  ];
+
+  els.updateTitle.textContent = `Version ${latestVersion} is available on GitHub.`;
+  els.updateMeta.textContent = metaParts.filter(Boolean).join(" · ");
+}
+
+function hideUpdateModalForSession() {
+  if (!state.update.latestVersion) {
+    state.update.modalOpen = false;
+    renderUpdateModal();
+    return;
+  }
+
+  state.update.postponedVersion = state.update.latestVersion;
+  state.update.modalOpen = false;
+  renderUpdateModal();
+}
+
+async function getCurrentAppVersion() {
+  if (state.update.currentVersion) return state.update.currentVersion;
+  state.update.currentVersion = normalizeVersionTag(await getVersion());
+  return state.update.currentVersion;
+}
+
+function shouldShowRelease(latestVersion, currentVersion) {
+  if (!latestVersion || !currentVersion) return false;
+  if (compareVersions(latestVersion, currentVersion) <= 0) return false;
+
+  const dismissedVersion = normalizeVersionTag(state.update.dismissedVersion);
+  if (!dismissedVersion) return true;
+  return compareVersions(latestVersion, dismissedVersion) > 0;
+}
+
+async function checkForUpdates() {
+  if (state.update.checking) return;
+  state.update.checking = true;
+
+  try {
+    const currentVersion = await getCurrentAppVersion();
+    const response = await fetch(UPDATE_RELEASES_API_URL, {
+      headers: {
+        Accept: "application/vnd.github+json",
+      },
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      throw new Error(`GitHub returned ${response.status}`);
+    }
+
+    const release = await response.json();
+    const latestVersion = normalizeVersionTag(release.tag_name || release.name);
+
+    state.update.latestVersion = latestVersion;
+    state.update.releaseName = String(release.name || release.tag_name || latestVersion);
+    state.update.releaseUrl = String(release.html_url || UPDATE_RELEASES_PAGE_URL);
+    state.update.publishedAt = String(release.published_at || "");
+    state.update.available = shouldShowRelease(latestVersion, currentVersion);
+    if (state.update.available) {
+      state.update.modalOpen = state.update.postponedVersion !== latestVersion;
+    } else {
+      state.update.modalOpen = false;
+      state.update.postponedVersion = "";
+    }
+    renderUpdateModal();
+  } catch {
+    state.update.available = false;
+    state.update.modalOpen = false;
+    renderUpdateModal();
+  } finally {
+    state.update.checking = false;
+  }
+}
+
+function scheduleUpdateChecks() {
+  if (state.update.timerId) {
+    window.clearInterval(state.update.timerId);
+  }
+
+  state.update.timerId = window.setInterval(() => {
+    checkForUpdates().catch(() => {
+      // Keep update checks silent when GitHub is unavailable.
+    });
+  }, UPDATE_CHECK_INTERVAL_MS);
 }
 
 function saveSettings() {
@@ -363,6 +623,8 @@ function environmentSummary() {
 
 function humanBytesLike(value) {
   if (value == null || value === "") return "—";
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric <= 0) return "—";
   return String(value);
 }
 
@@ -1067,6 +1329,28 @@ async function wireEvents() {
     state.player.seeking = false;
     renderPlayer();
   });
+  els.updateDownload.addEventListener("click", async () => {
+    if (!state.update.releaseUrl) return;
+
+    try {
+      hideUpdateModalForSession();
+      await openExternalUrl(state.update.releaseUrl);
+    } catch (error) {
+      state.update.modalOpen = true;
+      renderUpdateModal();
+      setStatus("Error", "", "error");
+      setError(`Could not open the update page: ${String(error)}`);
+    }
+  });
+  els.updateLater.addEventListener("click", hideUpdateModalForSession);
+  els.updateDismiss.addEventListener("click", () => {
+    if (!state.update.latestVersion) return;
+    saveDismissedUpdateVersion(state.update.latestVersion);
+    state.update.available = false;
+    state.update.modalOpen = false;
+    renderUpdateModal();
+  });
+  els.updateBackdrop.addEventListener("click", hideUpdateModalForSession);
   els.profileTrigger.addEventListener("click", (event) => {
     event.stopPropagation();
     toggleProfileCard();
@@ -1092,6 +1376,10 @@ async function wireEvents() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
+      if (state.update.modalOpen) {
+        hideUpdateModalForSession();
+        return;
+      }
       closeProfileCard();
     }
   });
@@ -1103,6 +1391,7 @@ function initialize() {
   normalizeSettings();
   renderProfileCard();
   renderScanProgress();
+  renderUpdateModal();
   renderSummary();
   renderChips();
   renderResults();
@@ -1117,6 +1406,10 @@ function initialize() {
   bootstrapDefaultPath().catch((error) => {
     setError(String(error));
   });
+  checkForUpdates().catch(() => {
+    // Keep startup update checks silent when GitHub is unavailable.
+  });
+  scheduleUpdateChecks();
 }
 
 async function bootstrapDefaultPath() {

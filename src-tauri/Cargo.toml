@@ -1,6 +1,6 @@
 [package]
 name = "rekordport"
-version = "0.1.0"
+version = "0.2.0"
 description = "rekordport desktop app"
 authors = ["chuan"]
 edition = "2021"

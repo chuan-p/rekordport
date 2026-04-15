@@ -1455,6 +1455,12 @@ fn source_bitrate_kbps(track: &Track, source: &Path) -> Result<u32, String> {
     Ok(track.bitrate.unwrap_or(0))
 }
 
+fn resolved_track_bitrate(track: &Track) -> Option<u32> {
+    source_bitrate_kbps(track, Path::new(&track.full_path))
+        .ok()
+        .filter(|value| *value > 0)
+}
+
 fn run_sqlcipher(db_path: &Path, key: &str, sql: &str) -> Result<String, String> {
     if !command_available("sqlcipher") {
         return Err("sqlcipher command not found in PATH or bundled sidecar".into());
@@ -1637,7 +1643,7 @@ where
             None
         };
 
-        tracks.push(Track {
+        let mut track = Track {
             id: row.id,
             source_id: None,
             analysis_state: None,
@@ -1650,7 +1656,13 @@ where
             sample_rate: row.sample_rate,
             bitrate: row.bitrate,
             full_path: row.full_path,
-        });
+        };
+
+        if track.bitrate.unwrap_or(0) == 0 {
+            track.bitrate = resolved_track_bitrate(&track);
+        }
+
+        tracks.push(track);
 
         let current = index + 1;
         if current == total || current == 1 || current % progress_step == 0 {
@@ -3573,6 +3585,59 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
 
         assert!(probe.has_attached_pic);
         assert_eq!(probe.sample_rate, Some(44_100));
+    }
+
+    #[test]
+    fn resolves_missing_flac_bitrate_from_probe() {
+        if !command_available("ffmpeg") {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let raw = dir.path().join("track.raw");
+        let source = dir.path().join("track.flac");
+        fs::write(&raw, vec![0u8; 44_100 * 2]).expect("raw audio fixture should be written");
+        let mut ffmpeg = prepared_command("ffmpeg").expect("ffmpeg command should resolve");
+        ffmpeg.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            "-i",
+        ]);
+        ffmpeg.arg(&raw);
+        ffmpeg.args(["-c:a", "flac", "-y"]);
+        ffmpeg.arg(&source);
+        let output = ffmpeg
+            .output()
+            .expect("ffmpeg fixture generation should succeed");
+        assert!(
+            output.status.success(),
+            "ffmpeg fixture generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let track = Track {
+            id: "1".to_string(),
+            source_id: None,
+            analysis_state: None,
+            analysis_note: None,
+            title: "Fixture".to_string(),
+            artist: "Fixture".to_string(),
+            file_type: "FLAC".to_string(),
+            codec_name: None,
+            bit_depth: Some(16),
+            sample_rate: Some(44_100),
+            bitrate: Some(0),
+            full_path: source.to_string_lossy().to_string(),
+        };
+
+        assert!(resolved_track_bitrate(&track).unwrap_or(0) > 0);
     }
 
     #[test]

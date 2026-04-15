@@ -153,5 +153,20 @@
         <p class="profile-card-year" id="profile-year"></p>
       </div>
     </section>
+
+    <div class="update-backdrop" id="update-backdrop" hidden></div>
+    <section class="update-dialog" id="update-dialog" hidden aria-label="Application update available" aria-modal="true" role="dialog">
+      <p class="update-kicker">Update Available</p>
+      <h3 class="update-title" id="update-title">A newer version of rekordport is ready to download.</h3>
+      <p class="update-meta" id="update-meta"></p>
+      <p class="update-body">
+        A new GitHub release has been detected. Download the latest build to update rekordport.
+      </p>
+      <div class="update-actions">
+        <button id="update-download" class="primary" type="button">Download from GitHub</button>
+        <button id="update-later" class="ghost" type="button">Remind Me Later</button>
+        <button id="update-dismiss" class="ghost" type="button">Skip This Version</button>
+      </div>
+    </section>
   </body>
 </html>
