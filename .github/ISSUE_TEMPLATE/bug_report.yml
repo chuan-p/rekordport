@@ -41,7 +41,7 @@ body:
     attributes:
       label: App version or commit
       description: A release tag, commit SHA, or branch name
-      placeholder: v0.1.0 or 0123abcd
+      placeholder: v0.2.0 or 0123abcd
     validations:
       required: true
   - type: textarea
