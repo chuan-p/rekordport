@@ -1,7 +1,10 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import appIcon from "../src-tauri/icons/128x128.png";
 import "./style.css";
+
+// Keep the About card icon inside Vite's public assets so dev mode never tries
+// to import raw files out of src-tauri.
+const appIcon = `${import.meta.env.BASE_URL}app-icon.png`;
 
 const DEFAULT_MIN_BIT_DEPTH = 16;
 const STORAGE_KEY = "rekordbox-lossless-scan-settings";

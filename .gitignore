@@ -22,3 +22,4 @@ src-tauri/tauri.generated.conf.json
 src-tauri/bin/*
 !src-tauri/bin/README.md
 .DS_Store
+public/app-icon.png
