@@ -1,12 +1,12 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import appIcon from "../src-tauri/icons/128x128.png";
 import "./style.css";
 
 const DEFAULT_MIN_BIT_DEPTH = 16;
 const STORAGE_KEY = "rekordbox-lossless-scan-settings";
 const IS_MACOS = /\bMac OS X\b|\bMacintosh\b/.test(navigator.userAgent);
 const IS_WINDOWS = /\bWindows\b/.test(navigator.userAgent);
+const appIcon = `${import.meta.env.BASE_URL}128x128.png`;
 const PROFILE = {
   kicker: "About",
   name: "rekordport",
@@ -343,7 +343,8 @@ function normalizeConflictResolution(value) {
 }
 
 function formatNumber(value) {
-  return new Intl.NumberFormat("en-US").format(value);
+  const numeric = Number(value);
+  return new Intl.NumberFormat("en-US").format(Number.isFinite(numeric) ? numeric : 0);
 }
 
 function dependencySourceSummary() {
@@ -401,12 +402,6 @@ function formatAudioMeta(track) {
     `<span><strong>${escapeHtml(sampleRateLabel)}</strong>Hz</span>`,
     `<span><strong>${escapeHtml(bitrate)}</strong> kbps</span>`,
   ];
-  if (track.scan_issue === "wav_extensible") {
-    const note = track.scan_note || "WAV header uses WAVE_FORMAT_EXTENSIBLE.";
-    items.push(
-      `<span class="audio-meta-issue" title="${escapeHtml(note)}">wav_extensible</span>`,
-    );
-  }
   return `
     <div class="audio-meta">
       ${items.join("")}
@@ -642,13 +637,14 @@ function selectableTracks() {
 
 function renderSummary() {
   const summary = state.scanSummary || summarizeTracks(state.tracks);
+  const hiResCount = summary.hi_res ?? summary.hires ?? 0;
   const convertedCount = state.tracks.filter((track) => track.status === "converted").length;
   const selectedCount = state.selectedIds.size;
   const items = [
     summary.candidate_total ? `Candidates ${formatNumber(summary.candidate_total)}` : null,
     `FLAC ${formatNumber(summary.flac)}`,
     `ALAC ${formatNumber(summary.alac)}`,
-    `Hi-Res ${formatNumber(summary.hires)}`,
+    `Hi-Res ${formatNumber(hiResCount)}`,
     summary.wav_extensible ? `WAV_EXT ${formatNumber(summary.wav_extensible)}` : null,
     summary.unreadable_m4a ? `Unreadable M4A ${formatNumber(summary.unreadable_m4a)}` : null,
   ];
@@ -714,7 +710,12 @@ function renderResults() {
           </td>
           <td>${escapeHtml(track.title || "—")}</td>
           <td>${escapeHtml(track.artist || "—")}</td>
-          <td><span class="type-badge">${escapeHtml(track.file_type)}</span></td>
+          <td class="type-cell">
+            <span class="type-badge">${escapeHtml(track.file_type)}</span>
+            ${track.scan_issue === "wav_extensible"
+              ? `<div class="type-detail" title="${escapeHtml(track.scan_note || "WAV header uses WAVE_FORMAT_EXTENSIBLE.")}">wav_extensible</div>`
+              : ""}
+          </td>
           <td class="status-cell">
             <span class="status-badge" data-status="${escapeHtml(track.status || "pending")}">${escapeHtml(statusLabel(track))}</span>
             ${statusDetail ? `<div class="status-detail">${escapeHtml(statusDetail)}</div>` : ""}
@@ -858,7 +859,12 @@ async function scan() {
       analysis_state: track.analysis_state || null,
       analysis_note: track.analysis_note || "",
     }));
-    state.scanSummary = response.summary || null;
+    state.scanSummary = response.summary
+      ? {
+        ...response.summary,
+        hires: response.summary.hires ?? response.summary.hi_res ?? 0,
+      }
+      : null;
     state.selectedIds = new Set();
     state.conversionCompleted = false;
     setStatus("Scanned", "", "ready");
@@ -874,11 +880,6 @@ async function scan() {
       if (response.summary.non_alac_m4a) {
         noteParts.push(
           `${formatNumber(response.summary.non_alac_m4a)} M4A candidates were not ALAC.`
-        );
-      }
-      if (response.summary.wav_extensible) {
-        noteParts.push(
-          `${formatNumber(response.summary.wav_extensible)} WAV files use WAVE_FORMAT_EXTENSIBLE headers that some CDJ/XDJ players reject.`
         );
       }
       els.footerNote.textContent = noteParts.join(" ");

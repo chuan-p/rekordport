@@ -660,6 +660,7 @@ tbody tr[data-previewing="true"]:hover {
 }
 
 .type-badge,
+.type-detail,
 .status-badge {
   display: inline-flex;
   align-items: center;
@@ -675,6 +676,19 @@ tbody tr[data-previewing="true"]:hover {
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.05);
   color: var(--text);
+}
+
+.type-cell {
+  min-width: 120px;
+}
+
+.type-detail {
+  margin-top: 6px;
+  border: 1px solid rgba(255, 202, 145, 0.2);
+  background: rgba(255, 176, 96, 0.12);
+  color: rgba(255, 226, 188, 0.96);
+  font-size: 0.76rem;
+  white-space: nowrap;
 }
 
 .status-badge {
@@ -714,15 +728,6 @@ tbody tr[data-previewing="true"]:hover {
   color: var(--muted);
   font-size: 0.73rem;
   white-space: nowrap;
-}
-
-.audio-meta .audio-meta-issue {
-  align-items: center;
-  border-color: rgba(255, 202, 145, 0.22);
-  background: rgba(255, 176, 96, 0.12);
-  color: rgba(255, 226, 188, 0.96);
-  font-weight: 700;
-  letter-spacing: 0.02em;
 }
 
 .audio-meta strong {
