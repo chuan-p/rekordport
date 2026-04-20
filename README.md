@@ -15,6 +15,7 @@ rekordport is a tool for scanning a rekordbox library, finding hi-res files CDJs
 - Scans `master.db` for:
   - FLAC
   - ALAC
+  - WAV files with `WAVE_FORMAT_EXTENSIBLE` headers that some CDJ/XDJ units reject
   - WAV / AIFF above 16-bit or above 48kHz
 - Lets you preview results in a desktop UI
 - Converts selected tracks to `WAV`, `AIFF`, `MP3 320kbps`, or `M4A 320kbps`
@@ -114,6 +115,7 @@ See [src-tauri/bin/README.md](src-tauri/bin/README.md) for sidecar naming and pa
 - `M4A 320kbps` requires the Apple `aac_at` encoder and is usually only available on macOS.
 - The app uses `ffmpeg` for probing, preview generation, and conversion.
 - The app uses `sqlcipher` for direct rekordbox database access.
+- Some otherwise compatible `WAV` files still fail on standalone CDJ/XDJ units because they use a `WAVE_FORMAT_EXTENSIBLE` header instead of standard PCM. rekordport now flags those files during scan so you can convert them into a safer output.
 
 ## Current Limitations
 

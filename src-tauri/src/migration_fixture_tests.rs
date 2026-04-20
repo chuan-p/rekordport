@@ -82,6 +82,8 @@ INSERT INTO djmdSongPlaylist (ContentID, PlaylistID, updated_at) VALUES ('1', '1
     let track = Track {
         id: "1".to_string(),
         source_id: None,
+        scan_issue: None,
+        scan_note: None,
         analysis_state: None,
         analysis_note: None,
         title: "Fixture Track".to_string(),
@@ -102,7 +104,7 @@ INSERT INTO djmdSongPlaylist (ContentID, PlaylistID, updated_at) VALUES ('1', '1
     let spec = preset_spec("wav-auto").expect("fixture preset should be valid");
     let migrated = migrate_tracks_in_db(
         &db_path,
-        &[track.clone()],
+        std::slice::from_ref(&track),
         &[output_track],
         DEFAULT_KEY,
         &spec,
@@ -248,6 +250,8 @@ VALUES
     let track = Track {
         id: "1".to_string(),
         source_id: None,
+        scan_issue: None,
+        scan_note: None,
         analysis_state: None,
         analysis_note: None,
         title: "Fixture Track".to_string(),
@@ -268,7 +272,7 @@ VALUES
     let spec = preset_spec("mp3-320").expect("fixture preset should be valid");
     let migrated = migrate_tracks_in_db(
         &db_path,
-        &[track.clone()],
+        std::slice::from_ref(&track),
         &[output_track],
         DEFAULT_KEY,
         &spec,

@@ -79,6 +79,8 @@ mod tests {
         let track = Track {
             id: "1".to_string(),
             source_id: None,
+            scan_issue: None,
+            scan_note: None,
             analysis_state: None,
             analysis_note: None,
             title: "Track".to_string(),
