@@ -2,6 +2,11 @@
 
 This directory holds the packaged assets for the current release.
 
+## What's New
+
+- Added detection for `WAV extensible format` files during library scans.
+- Improved compatibility with newer WAV variants that some CDJ/XDJ units may reject.
+
 ## Files
 
 - `rekordport_0.2.3_windows.exe`
