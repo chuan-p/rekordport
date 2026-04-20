@@ -1,0 +1,72 @@
+[
+  {
+    "filename": "extensible_stereo_48k_16bit.wav",
+    "path": "/Users/chuanpeng/Documents/rkb-lossless-process/.codex-output/test-audio/wav-fixtures-2026-04-20/extensible_stereo_48k_16bit.wav",
+    "wFormatTagHexLE": "feff",
+    "sampleRateHz": 48000,
+    "channels": 2,
+    "bitsPerSample": 16,
+    "codec": "pcm_s16le",
+    "note": "48 kHz stereo WAV_EXTENSIBLE test file (wFormatTag FFFE)."
+  },
+  {
+    "filename": "extensible_stereo_48k_24bit.wav",
+    "path": "/Users/chuanpeng/Documents/rkb-lossless-process/.codex-output/test-audio/wav-fixtures-2026-04-20/extensible_stereo_48k_24bit.wav",
+    "wFormatTagHexLE": "feff",
+    "sampleRateHz": 48000,
+    "channels": 2,
+    "bitsPerSample": 24,
+    "codec": "pcm_s24le",
+    "note": "48 kHz / 24-bit stereo WAV_EXTENSIBLE hi-res test file."
+  },
+  {
+    "filename": "extensible_stereo_96k_16bit.wav",
+    "path": "/Users/chuanpeng/Documents/rkb-lossless-process/.codex-output/test-audio/wav-fixtures-2026-04-20/extensible_stereo_96k_16bit.wav",
+    "wFormatTagHexLE": "feff",
+    "sampleRateHz": 96000,
+    "channels": 2,
+    "bitsPerSample": 16,
+    "codec": "pcm_s16le",
+    "note": "96 kHz stereo WAV_EXTENSIBLE test file (wFormatTag FFFE)."
+  },
+  {
+    "filename": "extensible_stereo_96k_24bit.wav",
+    "path": "/Users/chuanpeng/Documents/rkb-lossless-process/.codex-output/test-audio/wav-fixtures-2026-04-20/extensible_stereo_96k_24bit.wav",
+    "wFormatTagHexLE": "feff",
+    "sampleRateHz": 96000,
+    "channels": 2,
+    "bitsPerSample": 24,
+    "codec": "pcm_s24le",
+    "note": "96 kHz / 24-bit stereo WAV_EXTENSIBLE hi-res test file."
+  },
+  {
+    "filename": "pcm_stereo_44k1_16bit.wav",
+    "path": "/Users/chuanpeng/Documents/rkb-lossless-process/.codex-output/test-audio/wav-fixtures-2026-04-20/pcm_stereo_44k1_16bit.wav",
+    "wFormatTagHexLE": "0100",
+    "sampleRateHz": 44100,
+    "channels": 2,
+    "bitsPerSample": 16,
+    "codec": "pcm_s16le",
+    "note": "Baseline 44.1 kHz stereo PCM (wFormatTag 0001)."
+  },
+  {
+    "filename": "pcm_stereo_48k_16bit.wav",
+    "path": "/Users/chuanpeng/Documents/rkb-lossless-process/.codex-output/test-audio/wav-fixtures-2026-04-20/pcm_stereo_48k_16bit.wav",
+    "wFormatTagHexLE": "0100",
+    "sampleRateHz": 48000,
+    "channels": 2,
+    "bitsPerSample": 16,
+    "codec": "pcm_s16le",
+    "note": "Baseline 48 kHz stereo PCM (wFormatTag 0001)."
+  },
+  {
+    "filename": "pcm_stereo_96k_16bit.wav",
+    "path": "/Users/chuanpeng/Documents/rkb-lossless-process/.codex-output/test-audio/wav-fixtures-2026-04-20/pcm_stereo_96k_16bit.wav",
+    "wFormatTagHexLE": "0100",
+    "sampleRateHz": 96000,
+    "channels": 2,
+    "bitsPerSample": 16,
+    "codec": "pcm_s16le",
+    "note": "96 kHz stereo PCM with classic fmt chunk (wFormatTag 0001)."
+  }
+]

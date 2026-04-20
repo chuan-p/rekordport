@@ -396,11 +396,20 @@ function formatAudioMeta(track) {
     : Number(sampleRate) >= 1000
       ? `${(Number(sampleRate) / 1000).toFixed(Number(sampleRate) % 1000 === 0 ? 0 : 1)}k`
       : sampleRate;
+  const items = [
+    `<span><strong>${escapeHtml(bitDepth)}</strong>-bit</span>`,
+    `<span><strong>${escapeHtml(sampleRateLabel)}</strong>Hz</span>`,
+    `<span><strong>${escapeHtml(bitrate)}</strong> kbps</span>`,
+  ];
+  if (track.scan_issue === "wav_extensible") {
+    const note = track.scan_note || "WAV header uses WAVE_FORMAT_EXTENSIBLE.";
+    items.push(
+      `<span class="audio-meta-issue" title="${escapeHtml(note)}">wav_extensible</span>`,
+    );
+  }
   return `
     <div class="audio-meta">
-      <span><strong>${escapeHtml(bitDepth)}</strong>-bit</span>
-      <span><strong>${escapeHtml(sampleRateLabel)}</strong>Hz</span>
-      <span><strong>${escapeHtml(bitrate)}</strong> kbps</span>
+      ${items.join("")}
     </div>
   `;
 }
@@ -694,7 +703,7 @@ function renderResults() {
       (track) => {
         const statusDetail = track.status === "converted"
           ? (track.analysis_state === "none" && track.analysis_note ? track.analysis_note : "")
-          : (track.scan_note || "");
+          : "";
         return `
         <tr data-id="${escapeHtml(track.id)}" ${previewTrack()?.id === track.id ? 'data-previewing="true"' : ""}>
           <td class="check-cell">
