@@ -4,6 +4,8 @@ use std::env;
 use std::fs;
 use std::io;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -25,6 +27,8 @@ mod process;
 
 const DEFAULT_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
 const HI_RES_SAMPLE_RATE_THRESHOLD: u32 = 48_000;
+const WAV_FORMAT_TAG_PCM: u16 = 0x0001;
+const WAV_FORMAT_TAG_EXTENSIBLE: u16 = 0xFFFE;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -49,6 +53,10 @@ struct Track {
     id: String,
     #[serde(default)]
     source_id: Option<String>,
+    #[serde(default)]
+    scan_issue: Option<String>,
+    #[serde(default)]
+    scan_note: Option<String>,
     #[serde(default)]
     analysis_state: Option<String>,
     #[serde(default)]
@@ -93,6 +101,7 @@ struct ScanSummary {
     flac: usize,
     alac: usize,
     hi_res: usize,
+    wav_extensible: usize,
     m4a_candidates: usize,
     unreadable_m4a: usize,
     non_alac_m4a: usize,
@@ -144,6 +153,7 @@ struct ConvertResponse {
     source_cleanup_failures: usize,
     cleanup_archived_dirs: usize,
     cleanup_archive_dir: Option<String>,
+    warnings: Vec<String>,
     converted_tracks: Vec<Track>,
 }
 
@@ -194,6 +204,7 @@ struct ValidatedContentFile {
 struct CleanupReport {
     archived_dirs: usize,
     archive_dir: Option<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +229,7 @@ struct ScanRow {
 #[derive(Debug, Default)]
 struct ScanStats {
     candidate_total: usize,
+    wav_extensible: usize,
     m4a_candidates: usize,
     unreadable_m4a: usize,
     non_alac_m4a: usize,
@@ -243,10 +255,37 @@ struct AudioProbe {
     has_attached_pic: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AudioProbeCacheSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct AudioProbeCacheEntry {
+    signature: AudioProbeCacheSignature,
+    probe: AudioProbe,
+}
+
 static COMMAND_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static COMMAND_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
 static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-static AUDIO_PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, AudioProbe>>> = OnceLock::new();
+static AUDIO_PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, AudioProbeCacheEntry>>> = OnceLock::new();
+
+fn refresh_command_discovery_caches() {
+    if let Some(cache) = COMMAND_CACHE.get() {
+        cache.lock().expect("command cache lock poisoned").clear();
+    }
+    if let Some(cache) = COMMAND_PATH_CACHE.get() {
+        cache
+            .lock()
+            .expect("command path cache lock poisoned")
+            .clear();
+    }
+    if let Some(cache) = ENCODER_CACHE.get() {
+        cache.lock().expect("encoder cache lock poisoned").clear();
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn hidden_windows_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -728,6 +767,12 @@ fn write_path(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     })
 }
 
+fn canonicalize_path(path: &Path) -> Result<PathBuf, String> {
+    retry_io_operation(format!("failed to canonicalize {}", path.display()), || {
+        fs::canonicalize(path)
+    })
+}
+
 fn open_file_path(path: &Path) -> Result<fs::File, String> {
     retry_io_operation(format!("failed to open {}", path.display()), || {
         fs::File::open(path)
@@ -814,10 +859,10 @@ fn windows_preview_strategy(source: &Path) -> WindowsPreviewStrategy {
 fn preview_requires_transcode(source: &Path) -> bool {
     #[cfg(any(target_os = "windows", test))]
     {
-        return matches!(
+        matches!(
             windows_preview_strategy(source),
             WindowsPreviewStrategy::TranscodeMp3
-        );
+        )
     }
 
     #[cfg(all(not(target_os = "windows"), not(test)))]
@@ -939,6 +984,7 @@ fn preview_path_string(path: &Path) -> String {
 }
 
 fn prepare_preview_path_impl(path: String) -> Result<String, String> {
+    refresh_command_discovery_caches();
     let source = PathBuf::from(&path);
     if !path_exists(&source)? {
         return Err(format!("path not found: {}", source.display()));
@@ -1300,17 +1346,28 @@ fn parse_ffmpeg_audio_probe(text: &str) -> AudioProbe {
     }
 }
 
+fn audio_probe_cache_signature(path: &Path) -> Result<AudioProbeCacheSignature, String> {
+    let metadata = metadata_path(path)?;
+    Ok(AudioProbeCacheSignature {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 fn probe_audio(path: &Path) -> Result<AudioProbe, String> {
     if !command_available("ffmpeg") {
         return Ok(AudioProbe::default());
     }
 
+    let signature = audio_probe_cache_signature(path)?;
     let cache_key = path.to_path_buf();
     let cache = AUDIO_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
         let guard = cache.lock().expect("audio probe cache lock poisoned");
-        if let Some(value) = guard.get(&cache_key) {
-            return Ok(value.clone());
+        if let Some(entry) = guard.get(&cache_key) {
+            if entry.signature == signature {
+                return Ok(entry.probe.clone());
+            }
         }
     }
 
@@ -1332,7 +1389,13 @@ fn probe_audio(path: &Path) -> Result<AudioProbe, String> {
     let probe = parse_ffmpeg_audio_probe(&text);
 
     let mut guard = cache.lock().expect("audio probe cache lock poisoned");
-    guard.insert(cache_key, probe.clone());
+    guard.insert(
+        cache_key,
+        AudioProbeCacheEntry {
+            signature,
+            probe: probe.clone(),
+        },
+    );
     Ok(probe)
 }
 
@@ -1531,6 +1594,75 @@ fn parse_optional_u32(value: Option<&str>) -> Option<u32> {
         .and_then(|value| value.parse::<u32>().ok())
 }
 
+fn is_hi_res_pcm_row(row: &ScanRow, min_bit_depth: u32) -> bool {
+    matches!(row.file_type, 11 | 12)
+        && (row.bit_depth.unwrap_or(0) > min_bit_depth
+            || row.sample_rate.unwrap_or(0) > HI_RES_SAMPLE_RATE_THRESHOLD)
+}
+
+fn probe_wav_format_tag(path: &Path) -> Result<Option<u16>, String> {
+    let mut file = retry_io_operation(format!("failed to open {}", path.display()), || {
+        fs::File::open(path)
+    })?;
+
+    let mut header = [0_u8; 12];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => {
+            return Err(io_error_message(
+                &format!("failed to read WAV header from {}", path.display()),
+                &error,
+            ));
+        }
+    }
+
+    if &header[..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Ok(None);
+    }
+
+    loop {
+        let mut chunk_header = [0_u8; 8];
+        match file.read_exact(&mut chunk_header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => {
+                return Err(io_error_message(
+                    &format!("failed to read RIFF chunk header from {}", path.display()),
+                    &error,
+                ));
+            }
+        }
+
+        let chunk_size =
+            u32::from_le_bytes(chunk_header[4..8].try_into().expect("chunk size bytes")) as u64;
+
+        if &chunk_header[..4] == b"fmt " {
+            if chunk_size < 2 {
+                return Ok(None);
+            }
+
+            let mut format_tag = [0_u8; 2];
+            file.read_exact(&mut format_tag).map_err(|error| {
+                io_error_message(
+                    &format!("failed to read WAV fmt chunk from {}", path.display()),
+                    &error,
+                )
+            })?;
+            return Ok(Some(u16::from_le_bytes(format_tag)));
+        }
+
+        let padded_size = chunk_size + (chunk_size % 2);
+        file.seek(SeekFrom::Current(padded_size as i64))
+            .map_err(|error| {
+                io_error_message(
+                    &format!("failed to seek to next RIFF chunk in {}", path.display()),
+                    &error,
+                )
+            })?;
+    }
+}
+
 fn sampler_path_predicate(column: &str) -> String {
     format!(r"REPLACE(COALESCE({column}, ''), '\', '/') NOT LIKE '%/Sampler/%'")
 }
@@ -1543,7 +1675,7 @@ fn build_scan_query(min_bit_depth: u32, include_sampler: bool) -> String {
     };
 
     format!(
-        ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 6\n    OR (\n      c.FileType IN (11, 12)\n      AND (\n        COALESCE(c.BitDepth, 0) > {min_bit_depth}\n        OR COALESCE(c.SampleRate, 0) > {HI_RES_SAMPLE_RATE_THRESHOLD}\n      )\n    )\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
+        ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 6\n    OR c.FileType = 11\n    OR (\n      c.FileType = 12\n      AND (\n        COALESCE(c.BitDepth, 0) > {min_bit_depth}\n        OR COALESCE(c.SampleRate, 0) > {HI_RES_SAMPLE_RATE_THRESHOLD}\n      )\n    )\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
     )
 }
 
@@ -1630,6 +1762,41 @@ where
     let mut tracks = Vec::new();
 
     for (index, row) in rows.into_iter().enumerate() {
+        let hi_res_pcm = is_hi_res_pcm_row(&row, min_bit_depth);
+        let mut scan_issue = None;
+        let mut scan_note = None;
+        let mut include_track = matches!(row.file_type, 5 | 6) || hi_res_pcm;
+
+        if row.file_type == 11 && !hi_res_pcm && !row.full_path.trim().is_empty() {
+            let source = Path::new(&row.full_path);
+            if path_exists(source).unwrap_or(false) {
+                match probe_wav_format_tag(source).unwrap_or(None) {
+                    Some(WAV_FORMAT_TAG_EXTENSIBLE) => {
+                        include_track = true;
+                        stats.wav_extensible += 1;
+                        scan_issue = Some("wav_extensible".to_string());
+                        scan_note = Some(
+                            "WAV header uses WAVE_FORMAT_EXTENSIBLE. Some CDJ/XDJ players reject these files even when the bit depth and sample rate look compatible.".to_string(),
+                        );
+                    }
+                    Some(WAV_FORMAT_TAG_PCM) | None | Some(_) => {}
+                }
+            }
+        }
+
+        if !include_track {
+            let current = index + 1;
+            if current == total || current == 1 || current % progress_step == 0 {
+                on_progress(ScanProgressPayload {
+                    phase: "processing".to_string(),
+                    current,
+                    total,
+                    message: format!("Inspecting {current} / {total} candidate tracks…"),
+                });
+            }
+            continue;
+        }
+
         let codec_name = if row.file_type == 6 {
             stats.m4a_candidates += 1;
             Some("alac".to_string())
@@ -1640,6 +1807,8 @@ where
         tracks.push(Track {
             id: row.id,
             source_id: None,
+            scan_issue,
+            scan_note,
             analysis_state: None,
             analysis_note: None,
             title: row.title,
@@ -2229,21 +2398,50 @@ fn cleanup_orphan_zero_analysis_dirs(db_path: &Path, key: &str) -> Result<Cleanu
 
     let archive_root = rekordbox_root.join(format!("anlz-orphan-cleanup-{}", timestamp_token()));
     create_dir_all_path(&archive_root)?;
+    let mut archived_dirs = 0usize;
+    let mut warnings = Vec::new();
 
     for dir in &orphan_dirs {
-        let relative = dir
-            .strip_prefix(&analysis_root)
-            .map_err(|e| e.to_string())?;
+        let relative = match dir.strip_prefix(&analysis_root) {
+            Ok(relative) => relative,
+            Err(error) => {
+                warnings.push(format!(
+                    "Orphaned analysis folder cleanup skipped for {}: {}",
+                    dir.display(),
+                    error
+                ));
+                continue;
+            }
+        };
         let target = archive_root.join(relative);
         if let Some(parent) = target.parent() {
-            create_dir_all_path(parent)?;
+            if let Err(error) = create_dir_all_path(parent) {
+                warnings.push(format!(
+                    "Orphaned analysis folder cleanup skipped for {}: {}",
+                    dir.display(),
+                    error
+                ));
+                continue;
+            }
         }
-        rename_path(dir, &target)?;
+        match rename_path(dir, &target) {
+            Ok(()) => archived_dirs += 1,
+            Err(error) => warnings.push(format!(
+                "Orphaned analysis folder cleanup skipped for {}: {}",
+                dir.display(),
+                error
+            )),
+        }
     }
 
     Ok(CleanupReport {
-        archived_dirs: orphan_dirs.len(),
-        archive_dir: Some(archive_root.to_string_lossy().to_string()),
+        archived_dirs,
+        archive_dir: if archived_dirs > 0 {
+            Some(archive_root.to_string_lossy().to_string())
+        } else {
+            None
+        },
+        warnings,
     })
 }
 
@@ -2320,6 +2518,7 @@ fn ensure_database_writable(db_path: &Path, key: &str) -> Result<(), String> {
 }
 
 fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
+    refresh_command_discovery_caches();
     let db_path = req
         .db_path
         .filter(|value| !value.trim().is_empty())
@@ -2386,6 +2585,14 @@ fn backup_file_tree(source: &Path, backup_root: &Path) -> Result<PathBuf, String
     Ok(target)
 }
 
+fn existing_paths_refer_to_same_file(left: &Path, right: &Path) -> Result<bool, String> {
+    if !path_exists(left)? || !path_exists(right)? {
+        return Ok(false);
+    }
+
+    Ok(canonicalize_path(left)? == canonicalize_path(right)?)
+}
+
 fn build_target_path(
     source: &Path,
     spec: &ConversionSpec,
@@ -2399,6 +2606,9 @@ fn build_target_path(
         .ok_or_else(|| format!("missing file stem for {}", source.display()))?
         .to_string_lossy();
     let candidate = parent.join(format!("{stem}.{}", spec.extension));
+    if existing_paths_refer_to_same_file(source, &candidate)? {
+        return Ok(candidate);
+    }
     if !path_exists(&candidate)? {
         return Ok(candidate);
     }
@@ -2992,6 +3202,7 @@ fn convert_impl_with_progress<F>(
 where
     F: FnMut(ScanProgressPayload),
 {
+    refresh_command_discovery_caches();
     if req.tracks.is_empty() {
         return Err("no tracks selected".into());
     }
@@ -3081,7 +3292,18 @@ where
             }
         };
 
-    let cleanup_report = cleanup_orphan_zero_analysis_dirs(&db_path, DEFAULT_KEY)?;
+    let mut warnings = Vec::new();
+    let cleanup_report = match cleanup_orphan_zero_analysis_dirs(&db_path, DEFAULT_KEY) {
+        Ok(report) => report,
+        Err(error) => {
+            warnings.push(format!(
+                "Converted files and database changes were saved, but orphaned zero-byte analysis folders could not be archived automatically: {}",
+                error
+            ));
+            CleanupReport::default()
+        }
+    };
+    warnings.extend(cleanup_report.warnings.iter().cloned());
     let analysis_migrated_count = migrated_tracks
         .iter()
         .filter(|track| track.analysis_state.as_deref() == Some("migrated"))
@@ -3108,6 +3330,7 @@ where
         source_cleanup_failures,
         cleanup_archived_dirs: cleanup_report.archived_dirs,
         cleanup_archive_dir: cleanup_report.archive_dir,
+        warnings,
         converted_tracks: migrated_tracks,
     };
 
@@ -3128,6 +3351,7 @@ fn scan_impl_with_progress<F>(req: ScanRequest, mut on_progress: F) -> Result<Sc
 where
     F: FnMut(ScanProgressPayload),
 {
+    refresh_command_discovery_caches();
     on_progress(ScanProgressPayload {
         phase: "querying".to_string(),
         current: 0,
@@ -3155,7 +3379,14 @@ where
         .count();
     let hi_res = tracks
         .iter()
-        .filter(|track| matches!(track.file_type.as_str(), "WAV" | "AIFF"))
+        .filter(|track| {
+            matches!(track.file_type.as_str(), "WAV" | "AIFF")
+                && track.scan_issue.as_deref() != Some("wav_extensible")
+        })
+        .count();
+    let wav_extensible = tracks
+        .iter()
+        .filter(|track| track.scan_issue.as_deref() == Some("wav_extensible"))
         .count();
 
     let response = ScanResponse {
@@ -3166,6 +3397,7 @@ where
             flac,
             alac,
             hi_res,
+            wav_extensible,
             m4a_candidates: outcome.stats.m4a_candidates,
             unreadable_m4a: outcome.stats.unreadable_m4a,
             non_alac_m4a: outcome.stats.non_alac_m4a,
@@ -3333,7 +3565,7 @@ fn open_external_url(url: String) -> Result<(), String> {
         if status.success() {
             return Ok(());
         }
-        return Err(format!("failed to open url: {trimmed}"));
+        Err(format!("failed to open url: {trimmed}"))
     }
 
     #[cfg(target_os = "windows")]
@@ -3566,6 +3798,43 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
     }
 
     #[test]
+    fn reads_pcm_wav_format_tag() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = dir.path().join("pcm.wav");
+        let bytes = [
+            b'R', b'I', b'F', b'F', 0x1C, 0x00, 0x00, 0x00, b'W', b'A', b'V', b'E', b'f', b'm',
+            b't', b' ', 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x44, 0xAC, 0x00, 0x00,
+            0x10, 0xB1, 0x02, 0x00, 0x04, 0x00, 0x10, 0x00,
+        ];
+        fs::write(&path, bytes).expect("fixture should be written");
+
+        assert_eq!(
+            probe_wav_format_tag(&path).expect("format tag should be readable"),
+            Some(WAV_FORMAT_TAG_PCM)
+        );
+    }
+
+    #[test]
+    fn reads_extensible_wav_format_tag_after_junk_chunk() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = dir.path().join("ext.wav");
+        let bytes = [
+            b'R', b'I', b'F', b'F', 0x34, 0x00, 0x00, 0x00, b'W', b'A', b'V', b'E', b'J', b'U',
+            b'N', b'K', 0x04, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD, b'f', b'm', b't', b' ',
+            0x28, 0x00, 0x00, 0x00, 0xFE, 0xFF, 0x02, 0x00, 0x80, 0xBB, 0x00, 0x00, 0x00, 0x65,
+            0x04, 0x00, 0x06, 0x00, 0x18, 0x00, 0x16, 0x00, 0x18, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ];
+        fs::write(&path, bytes).expect("fixture should be written");
+
+        assert_eq!(
+            probe_wav_format_tag(&path).expect("format tag should be readable"),
+            Some(WAV_FORMAT_TAG_EXTENSIBLE)
+        );
+    }
+
+    #[test]
     fn detects_attached_picture_in_ffmpeg_probe() {
         let probe = parse_ffmpeg_audio_probe(
             "Input #0, flac, from 'song.flac':\n  Metadata:\n    title           : demo\n  Stream #0:0: Audio: flac, 44100 Hz, stereo, s16\n  Stream #0:1: Video: png, rgb24(pc), 600x600, 90k tbr, 90k tbn (attached pic)",
@@ -3624,6 +3893,34 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
     }
 
     #[test]
+    fn allows_same_format_target_path_when_it_is_the_source_file() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("track.wav");
+        fs::write(&source, b"source").expect("source fixture should be written");
+
+        let spec = preset_spec("wav-auto").expect("preset should be valid");
+        let target =
+            build_target_path(&source, &spec, ConflictResolution::Error).expect("target path");
+
+        assert_eq!(target, source);
+    }
+
+    #[test]
+    fn audio_probe_cache_signature_changes_when_file_is_rewritten() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("track.wav");
+        fs::write(&source, b"old").expect("source fixture should be written");
+
+        let first = audio_probe_cache_signature(&source).expect("signature should be readable");
+        thread::sleep(Duration::from_millis(2_100));
+        fs::write(&source, b"new").expect("rewritten fixture should be written");
+        let second = audio_probe_cache_signature(&source).expect("signature should be readable");
+
+        assert_eq!(first.len, second.len);
+        assert_ne!(first.modified, second.modified);
+    }
+
+    #[test]
     fn redirects_existing_archive_file_names() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let source = dir.path().join("track.flac");
@@ -3638,6 +3935,46 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
             redirected.file_name().and_then(|name| name.to_str()),
             Some("track-1000kbps (2).flac")
         );
+    }
+
+    #[test]
+    fn refreshes_command_discovery_caches() {
+        COMMAND_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("command cache lock poisoned")
+            .insert("ffmpeg".to_string(), false);
+        COMMAND_PATH_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("command path cache lock poisoned")
+            .insert("ffmpeg".to_string(), None);
+        ENCODER_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("encoder cache lock poisoned")
+            .insert("aac_at".to_string(), false);
+
+        refresh_command_discovery_caches();
+
+        assert!(COMMAND_CACHE
+            .get()
+            .expect("command cache should exist")
+            .lock()
+            .expect("command cache lock poisoned")
+            .is_empty());
+        assert!(COMMAND_PATH_CACHE
+            .get()
+            .expect("command path cache should exist")
+            .lock()
+            .expect("command path cache lock poisoned")
+            .is_empty());
+        assert!(ENCODER_CACHE
+            .get()
+            .expect("encoder cache should exist")
+            .lock()
+            .expect("encoder cache lock poisoned")
+            .is_empty());
     }
 
     #[test]

@@ -26,6 +26,8 @@ const state = {
   loading: false,
   loadingTask: null,
   preflight: null,
+  preflightRequestId: 0,
+  scanRequestId: 0,
   scanProgress: {
     active: false,
     phase: "idle",
@@ -189,6 +191,11 @@ function clearConvertProgress() {
     message: "",
   };
   renderConvertProgress();
+}
+
+function clearConversionMessage() {
+  els.footerCopy.hidden = true;
+  els.footerCopy.textContent = "";
 }
 
 function renderConvertButton() {
@@ -460,13 +467,30 @@ async function loadPreviewTrack(track, autoplay = true) {
     return;
   }
 
-  state.player.track = track;
-  state.player.currentTime = 0;
-  state.player.duration = 0;
-  state.player.loading = true;
-  state.player.seeking = false;
-  state.player.seekValue = 0;
-  const playablePath = await resolvePreviewPath(track.full_path);
+  const previousPlayerState = { ...state.player };
+  Object.assign(state.player, {
+    track,
+    currentTime: 0,
+    duration: 0,
+    loading: true,
+    seeking: false,
+    seekValue: 0,
+  });
+  renderPlayer();
+  renderResults();
+
+  let playablePath;
+  try {
+    playablePath = await resolvePreviewPath(track.full_path);
+  } catch (error) {
+    Object.assign(state.player, previousPlayerState);
+    renderPlayer();
+    renderResults();
+    setStatus("Error", "", "error");
+    setError(`This file could not be previewed: ${String(error)}`);
+    return;
+  }
+
   const src = convertFileSrc(normalizePreviewAssetPath(playablePath));
   els.previewAudio.src = src;
   els.previewAudio.load();
@@ -564,11 +588,39 @@ async function releasePreviewAudio() {
   return previous;
 }
 
+function currentScanRequestMatches(requestId, requestedPath, ignoreSamplerChecked) {
+  return requestId === state.scanRequestId
+    && requestedPath === els.dbPath.value
+    && ignoreSamplerChecked === els.includeSampler.checked;
+}
+
+async function invalidateScanState({ clearPreflight = false } = {}) {
+  state.scanRequestId += 1;
+  state.tracks = [];
+  state.scanSummary = null;
+  state.selectedIds = new Set();
+  state.conversionCompleted = false;
+  clearConversionMessage();
+  if (clearPreflight) {
+    state.preflight = null;
+    els.footerNote.textContent = "Checking local dependencies…";
+  } else {
+    applyPreflightState();
+  }
+  setStatus("Ready", "", "ready");
+  await releasePreviewAudio();
+  renderChips();
+  renderResults();
+}
+
 function summarizeTracks(tracks) {
   const flac = tracks.filter((t) => t.file_type === "FLAC").length;
   const alac = tracks.filter((t) => t.file_type === "ALAC").length;
-  const hires = tracks.filter((t) => t.file_type === "WAV" || t.file_type === "AIFF").length;
-  return { total: tracks.length, flac, alac, hires };
+  const wavExtensible = tracks.filter((t) => t.scan_issue === "wav_extensible").length;
+  const hires = tracks.filter(
+    (t) => (t.file_type === "WAV" || t.file_type === "AIFF") && t.scan_issue !== "wav_extensible",
+  ).length;
+  return { total: tracks.length, flac, alac, hires, wav_extensible: wavExtensible };
 }
 
 function selectedTracks() {
@@ -588,6 +640,7 @@ function renderSummary() {
     `FLAC ${formatNumber(summary.flac)}`,
     `ALAC ${formatNumber(summary.alac)}`,
     `Hi-Res ${formatNumber(summary.hires)}`,
+    summary.wav_extensible ? `WAV_EXT ${formatNumber(summary.wav_extensible)}` : null,
     summary.unreadable_m4a ? `Unreadable M4A ${formatNumber(summary.unreadable_m4a)}` : null,
   ];
   if (convertedCount > 0) items.push(`Converted ${formatNumber(convertedCount)}`);
@@ -612,6 +665,12 @@ function escapeHtml(value) {
 
 function renderResults() {
   const tracks = state.tracks;
+  const previewDisabled = state.loadingTask === "convert";
+  const emptyMessage = state.loading && state.loadingTask === "scan"
+    ? state.scanProgress.message || "Scanning rekordbox library…"
+    : state.scanSummary
+      ? "No results to display."
+      : "Click “Scan Library” to begin.";
   els.resultsCaption.textContent = state.loading && state.loadingTask === "scan"
     ? state.scanProgress.message || "Scanning rekordbox library…"
     : state.scanSummary?.candidate_total
@@ -619,9 +678,9 @@ function renderResults() {
       : `${formatNumber(tracks.length)} results`;
 
   if (!tracks.length) {
-  els.body.innerHTML = `
-    <tr class="empty-row">
-        <td colspan="8">${state.tracks.length ? "No results to display." : "Click “Scan Library” to begin."}</td>
+    els.body.innerHTML = `
+      <tr class="empty-row">
+        <td colspan="8">${emptyMessage}</td>
       </tr>
     `;
     els.selectAll.checked = false;
@@ -632,20 +691,24 @@ function renderResults() {
 
   els.body.innerHTML = tracks
     .map(
-      (track) => `
+      (track) => {
+        const statusDetail = track.status === "converted"
+          ? (track.analysis_state === "none" && track.analysis_note ? track.analysis_note : "")
+          : (track.scan_note || "");
+        return `
         <tr data-id="${escapeHtml(track.id)}" ${previewTrack()?.id === track.id ? 'data-previewing="true"' : ""}>
           <td class="check-cell">
             <input class="row-select" type="checkbox" data-id="${escapeHtml(track.id)}" ${track.status === "converted" ? "disabled" : ""} ${state.selectedIds.has(track.id) ? "checked" : ""} />
           </td>
           <td class="preview-cell">
-            <button class="preview-pill" type="button" data-preview-id="${escapeHtml(track.id)}" aria-label="Play preview" title="Play preview"></button>
+            <button class="preview-pill" type="button" data-preview-id="${escapeHtml(track.id)}" aria-label="Play preview" title="Play preview" ${previewDisabled ? "disabled" : ""}></button>
           </td>
           <td>${escapeHtml(track.title || "—")}</td>
           <td>${escapeHtml(track.artist || "—")}</td>
           <td><span class="type-badge">${escapeHtml(track.file_type)}</span></td>
           <td class="status-cell">
             <span class="status-badge" data-status="${escapeHtml(track.status || "pending")}">${escapeHtml(statusLabel(track))}</span>
-            ${track.status === "converted" && track.analysis_state === "none" && track.analysis_note ? `<div class="status-detail">${escapeHtml(track.analysis_note || analysisStateLabel(track))}</div>` : ""}
+            ${statusDetail ? `<div class="status-detail">${escapeHtml(statusDetail)}</div>` : ""}
           </td>
           <td>${formatAudioMeta(track)}</td>
           <td class="path-cell">
@@ -654,7 +717,8 @@ function renderResults() {
             </button>
           </td>
         </tr>
-      `,
+      `;
+      },
     )
     .join("");
 
@@ -665,11 +729,20 @@ function renderResults() {
   renderConvertButton();
 }
 
+function setContextControlsDisabled(disabled) {
+  els.dbPath.disabled = disabled;
+  els.pickDb.disabled = disabled;
+  els.includeSampler.disabled = disabled;
+  els.preset.disabled = disabled;
+  els.sourceHandling.disabled = disabled;
+}
+
 function setLoading(loading, task = null) {
   state.loading = loading;
   state.loadingTask = loading ? (task || "scan") : null;
   const scanReady = state.preflight ? state.preflight.scan_ready : true;
   els.scan.disabled = loading || !scanReady;
+  setContextControlsDisabled(loading);
   renderConvertButton();
   if (loading && state.loadingTask === "scan") {
     setStatus("Scanning", "", "busy");
@@ -695,17 +768,27 @@ function applyPreflightState() {
 }
 
 async function refreshPreflight() {
+  const requestId = state.preflightRequestId + 1;
+  const requestedPath = els.dbPath.value;
+  state.preflightRequestId = requestId;
+
   try {
     const response = await invoke("preflight_check", {
       req: {
-        dbPath: els.dbPath.value,
+        dbPath: requestedPath,
       },
     });
+    if (requestId !== state.preflightRequestId || requestedPath !== els.dbPath.value) {
+      return;
+    }
     state.preflight = response;
     applyPreflightState();
     renderSummary();
     renderResults();
   } catch (error) {
+    if (requestId !== state.preflightRequestId || requestedPath !== els.dbPath.value) {
+      return;
+    }
     state.preflight = null;
     els.footerNote.textContent = `Environment check failed: ${String(error)}`;
   }
@@ -715,11 +798,13 @@ async function pickDatabase() {
   try {
     const path = await invoke("pick_database_path");
     if (path) {
+      const pathChanged = path !== els.dbPath.value;
       els.dbPath.value = path;
-      state.scanSummary = null;
+      if (pathChanged) {
+        await invalidateScanState({ clearPreflight: true });
+      }
       saveSettings();
       await refreshPreflight();
-      renderSummary();
       renderChips();
       renderResults();
     }
@@ -730,7 +815,12 @@ async function pickDatabase() {
 }
 
 async function scan() {
+  const requestId = state.scanRequestId + 1;
+  const requestedPath = els.dbPath.value;
+  const ignoreSamplerChecked = els.includeSampler.checked;
+  state.scanRequestId = requestId;
   setError("");
+  clearConversionMessage();
   setLoading(true, "scan");
   setScanProgress({
     active: true,
@@ -742,15 +832,20 @@ async function scan() {
   try {
     const response = await invoke("scan_library", {
       req: {
-        dbPath: els.dbPath.value,
+        dbPath: requestedPath,
         minBitDepth: DEFAULT_MIN_BIT_DEPTH,
-        includeSampler: !els.includeSampler.checked,
+        includeSampler: !ignoreSamplerChecked,
       },
     });
+    if (!currentScanRequestMatches(requestId, requestedPath, ignoreSamplerChecked)) {
+      return;
+    }
 
     state.tracks = (response.tracks || []).map((track) => ({
       ...track,
       status: "pending",
+      scan_issue: track.scan_issue || null,
+      scan_note: track.scan_note || "",
       analysis_state: track.analysis_state || null,
       analysis_note: track.analysis_note || "",
     }));
@@ -772,6 +867,11 @@ async function scan() {
           `${formatNumber(response.summary.non_alac_m4a)} M4A candidates were not ALAC.`
         );
       }
+      if (response.summary.wav_extensible) {
+        noteParts.push(
+          `${formatNumber(response.summary.wav_extensible)} WAV files use WAVE_FORMAT_EXTENSIBLE headers that some CDJ/XDJ players reject.`
+        );
+      }
       els.footerNote.textContent = noteParts.join(" ");
     }
     renderSummary();
@@ -779,6 +879,9 @@ async function scan() {
     renderResults();
     saveSettings();
   } catch (error) {
+    if (!currentScanRequestMatches(requestId, requestedPath, ignoreSamplerChecked)) {
+      return;
+    }
     state.tracks = [];
     state.scanSummary = null;
     state.selectedIds = new Set();
@@ -795,6 +898,9 @@ async function scan() {
 async function convertSelected(conflictResolution = "error") {
   conflictResolution = normalizeConflictResolution(conflictResolution);
   const tracks = selectedTracks();
+  const dbPath = els.dbPath.value;
+  const preset = els.preset.value;
+  const sourceHandling = els.sourceHandling.value;
   if (!tracks.length) {
     setError("Select at least one track to convert.");
     return;
@@ -814,6 +920,7 @@ async function convertSelected(conflictResolution = "error") {
   }
 
   setError("");
+  clearConversionMessage();
   setLoading(true, "convert");
   const previousPreview = await releasePreviewAudio();
   setConvertProgress({
@@ -826,9 +933,9 @@ async function convertSelected(conflictResolution = "error") {
   try {
     const response = await invoke("convert_tracks", {
       req: {
-        dbPath: els.dbPath.value,
-        preset: els.preset.value,
-        sourceHandling: els.sourceHandling.value,
+        dbPath,
+        preset,
+        sourceHandling,
         archiveConflictResolution: conflictResolution,
         outputConflictResolution: conflictResolution,
         tracks,
@@ -862,13 +969,16 @@ async function convertSelected(conflictResolution = "error") {
     const cleanupText = response.cleanup_archived_dirs > 0
       ? ` Archived ${response.cleanup_archived_dirs} old empty analysis folders${response.cleanup_archive_dir ? ` (${response.cleanup_archive_dir})` : ""}.`
       : "";
+    const warningText = Array.isArray(response.warnings) && response.warnings.length > 0
+      ? ` ${response.warnings.join(" ")}`
+      : "";
     const sourceHandlingText = response.source_cleanup_mode === "trash"
       ? response.source_cleanup_failures > 0
         ? `Source files were moved to Trash where possible; ${response.source_cleanup_failures} file(s) could not be removed and were kept in place.`
         : "Source files were moved to Trash."
       : "Source files were renamed and kept in place.";
     els.footerCopy.hidden = false;
-    els.footerCopy.textContent = `Conversion complete: ${response.converted_count} new file(s) were written. ${sourceHandlingText} Old entries were removed and standard playlists were rebound.${cleanupText}`;
+    els.footerCopy.textContent = `Conversion complete: ${response.converted_count} new file(s) were written. ${sourceHandlingText} Old entries were removed and standard playlists were rebound.${cleanupText}${warningText}`;
     renderSummary();
     renderChips();
     renderResults();
@@ -926,20 +1036,16 @@ async function wireEvents() {
     }
   });
 
-  els.dbPath.addEventListener("input", () => {
-    state.scanSummary = null;
+  els.dbPath.addEventListener("input", async () => {
+    if (state.loading) return;
+    await invalidateScanState({ clearPreflight: true });
     saveSettings();
-    renderSummary();
-    renderChips();
-    renderResults();
     refreshPreflight().catch((error) => setError(String(error)));
   });
-  els.includeSampler.addEventListener("change", () => {
-    state.scanSummary = null;
+  els.includeSampler.addEventListener("change", async () => {
+    if (state.loading) return;
+    await invalidateScanState();
     saveSettings();
-    renderSummary();
-    renderChips();
-    renderResults();
   });
   els.preset.addEventListener("change", saveSettings);
   els.sourceHandling.addEventListener("change", saveSettings);
@@ -966,6 +1072,9 @@ async function wireEvents() {
 
     const previewButton = target.closest("button[data-preview-id]");
     if (previewButton) {
+      if (state.loadingTask === "convert") {
+        return;
+      }
       const trackId = previewButton.dataset.previewId;
       const track = state.tracks.find((candidate) => candidate.id === trackId);
       if (track) {
