@@ -50,8 +50,10 @@ const state = {
     currentTime: 0,
     duration: 0,
     loading: false,
+    desiredPlaying: false,
     seeking: false,
     seekValue: 0,
+    requestSeq: 0,
   },
   settings: loadSettings(),
   ui: {
@@ -390,6 +392,15 @@ function statusLabel(track) {
   return track.status === "converted" ? "Converted" : "Pending";
 }
 
+function previewButtonState(track) {
+  if (previewTrack()?.id !== track.id) return "play";
+  return isPreviewPlaybackActive() ? "pause" : "play";
+}
+
+function previewButtonLabel(track) {
+  return previewButtonState(track) === "pause" ? "Pause preview" : "Play preview";
+}
+
 function formatAudioMeta(track) {
   const bitDepth = humanBytesLike(track.bit_depth);
   const sampleRate = humanBytesLike(track.sample_rate);
@@ -446,21 +457,49 @@ function previewTrack() {
   return state.player.track;
 }
 
+function isPreviewPlaybackActive() {
+  const audio = els.previewAudio;
+  if (!previewTrack()) return false;
+  return state.player.desiredPlaying || (!audio.paused && !audio.ended);
+}
+
+function nextPreviewRequest() {
+  state.player.requestSeq += 1;
+  return state.player.requestSeq;
+}
+
+async function attemptPreviewPlayback(requestSeq, { reportError = false } = {}) {
+  try {
+    await els.previewAudio.play();
+    if (requestSeq !== state.player.requestSeq) return;
+    state.player.loading = false;
+    state.player.desiredPlaying = true;
+    renderPlayer();
+    renderResults();
+  } catch (error) {
+    if (requestSeq !== state.player.requestSeq || !state.player.desiredPlaying) return;
+    state.player.loading = false;
+    renderPlayer();
+    renderResults();
+    if (reportError) {
+      setError(`This file could not be previewed: ${String(error)}`);
+    }
+  }
+}
+
 function renderPlayer() {
   const audio = els.previewAudio;
   const track = previewTrack();
   const hasTrack = Boolean(track);
-  const isPlaying = hasTrack && !audio.paused && !audio.ended;
+  const isPlaying = hasTrack && isPreviewPlaybackActive();
   const displayedTime = state.player.seeking ? state.player.seekValue : state.player.currentTime;
 
   els.playerPlay.textContent = !hasTrack
     ? "No track selected"
-    : state.player.loading
-      ? "Loading"
-      : isPlaying
+    : isPlaying
         ? "Pause"
         : "Play";
-  els.playerPlay.disabled = !hasTrack || state.player.loading;
+  els.playerPlay.disabled = !hasTrack;
   els.playerSeek.disabled = !hasTrack || state.player.loading || !Number.isFinite(state.player.duration) || state.player.duration <= 0;
   els.playerSeek.max = String(Math.max(state.player.duration || 0, 0));
   els.playerSeek.value = String(Math.min(Math.max(displayedTime || 0, 0), state.player.duration || 0));
@@ -484,10 +523,12 @@ async function loadPreviewTrack(track, autoplay = true) {
     track,
     currentTime: 0,
     duration: 0,
-    loading: true,
+    loading: autoplay,
+    desiredPlaying: autoplay,
     seeking: false,
     seekValue: 0,
   });
+  const requestSeq = nextPreviewRequest();
   renderPlayer();
   renderResults();
 
@@ -511,15 +552,13 @@ async function loadPreviewTrack(track, autoplay = true) {
 
   if (!autoplay) {
     state.player.loading = false;
+    state.player.desiredPlaying = false;
     renderPlayer();
+    renderResults();
     return;
   }
 
-  try {
-    await els.previewAudio.play();
-  } catch {
-    // Some webviews need a metadata/canplay cycle before playback can start.
-  }
+  await attemptPreviewPlayback(requestSeq);
 }
 
 function previewErrorMessage() {
@@ -541,16 +580,27 @@ function togglePreviewPlay() {
   const audio = els.previewAudio;
   if (!previewTrack()) return;
 
-  if (audio.paused || audio.ended) {
-    state.player.loading = true;
-    renderPlayer();
-    audio.play().catch(() => {
-      state.player.loading = false;
-      renderPlayer();
-    });
-  } else {
+  if (isPreviewPlaybackActive()) {
+    nextPreviewRequest();
+    state.player.desiredPlaying = false;
+    state.player.loading = false;
     audio.pause();
+    renderPlayer();
+    renderResults();
+    return;
   }
+
+  state.player.desiredPlaying = true;
+  state.player.loading = true;
+  renderPlayer();
+  renderResults();
+  setError("");
+  const requestSeq = nextPreviewRequest();
+  attemptPreviewPlayback(requestSeq).catch(() => {
+    state.player.loading = false;
+    renderPlayer();
+    renderResults();
+  });
 }
 
 function waitForPreviewAudioRelease(audio) {
@@ -576,16 +626,18 @@ async function releasePreviewAudio() {
   const audio = els.previewAudio;
   const previous = {
     track: state.player.track,
-    wasPlaying: Boolean(state.player.track && !audio.paused && !audio.ended),
+    wasPlaying: Boolean(previewTrack() && isPreviewPlaybackActive()),
   };
   const hadSource = Boolean(audio.currentSrc || audio.src);
 
+  nextPreviewRequest();
   audio.pause();
   audio.removeAttribute("src");
   state.player.track = null;
   state.player.currentTime = 0;
   state.player.duration = 0;
   state.player.loading = false;
+  state.player.desiredPlaying = false;
   state.player.seeking = false;
   state.player.seekValue = 0;
   renderPlayer();
@@ -713,7 +765,7 @@ function renderResults() {
             <input class="row-select" type="checkbox" data-id="${escapeHtml(track.id)}" ${track.status === "converted" ? "disabled" : ""} ${state.selectedIds.has(track.id) ? "checked" : ""} />
           </td>
           <td class="preview-cell">
-            <button class="preview-pill" type="button" data-preview-id="${escapeHtml(track.id)}" aria-label="Play preview" title="Play preview" ${previewDisabled ? "disabled" : ""}></button>
+            <button class="preview-pill" type="button" data-preview-id="${escapeHtml(track.id)}" data-preview-state="${escapeHtml(previewButtonState(track))}" aria-label="${escapeHtml(previewButtonLabel(track))}" title="${escapeHtml(previewButtonLabel(track))}" ${previewDisabled ? "disabled" : ""}></button>
           </td>
           <td>${escapeHtml(track.title || "—")}</td>
           <td>${escapeHtml(track.artist || "—")}</td>
@@ -1091,7 +1143,11 @@ async function wireEvents() {
       const track = state.tracks.find((candidate) => candidate.id === trackId);
       if (track) {
         setError("");
-        await loadPreviewTrack(track, true);
+        if (previewTrack()?.id === track.id) {
+          togglePreviewPlay();
+        } else {
+          await loadPreviewTrack(track, true);
+        }
       }
       return;
     }
@@ -1127,8 +1183,15 @@ async function wireEvents() {
     state.player.duration = els.previewAudio.duration || 0;
     state.player.currentTime = els.previewAudio.currentTime || 0;
     state.player.seekValue = state.player.currentTime;
-    state.player.loading = false;
     renderPlayer();
+  });
+  els.previewAudio.addEventListener("canplay", () => {
+    if (!previewTrack() || !state.player.desiredPlaying || !els.previewAudio.paused) return;
+    attemptPreviewPlayback(state.player.requestSeq).catch(() => {
+      state.player.loading = false;
+      renderPlayer();
+      renderResults();
+    });
   });
   els.previewAudio.addEventListener("timeupdate", () => {
     state.player.currentTime = els.previewAudio.currentTime || 0;
@@ -1139,22 +1202,33 @@ async function wireEvents() {
   });
   els.previewAudio.addEventListener("play", () => {
     state.player.loading = false;
+    state.player.desiredPlaying = true;
     renderPlayer();
+    renderResults();
   });
   els.previewAudio.addEventListener("pause", () => {
+    const wasLoading = state.player.loading;
     state.player.loading = false;
+    if (!wasLoading) {
+      state.player.desiredPlaying = false;
+    }
     renderPlayer();
+    renderResults();
   });
   els.previewAudio.addEventListener("ended", () => {
     state.player.loading = false;
+    state.player.desiredPlaying = false;
     state.player.currentTime = 0;
     state.player.seeking = false;
     state.player.seekValue = 0;
     renderPlayer();
+    renderResults();
   });
   els.previewAudio.addEventListener("error", () => {
     state.player.loading = false;
+    state.player.desiredPlaying = false;
     renderPlayer();
+    renderResults();
     setStatus("Error", "", "error");
     setError(`This file could not be previewed: ${previewErrorMessage()}`);
   });

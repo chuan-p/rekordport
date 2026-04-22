@@ -756,6 +756,20 @@ tbody tr[data-previewing="true"]:hover {
   border-left: 9px solid rgba(242, 243, 245, 0.92);
 }
 
+.preview-pill[data-preview-state="pause"]::before {
+  width: 9px;
+  height: 12px;
+  margin-left: 0;
+  border: 0;
+  background:
+    linear-gradient(
+      90deg,
+      rgba(242, 243, 245, 0.92) 0 3px,
+      transparent 3px 6px,
+      rgba(242, 243, 245, 0.92) 6px 9px
+    );
+}
+
 .preview-pill:hover {
   background: rgba(255, 255, 255, 0.09);
   border-color: rgba(255, 255, 255, 0.18);
