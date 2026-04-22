@@ -101,11 +101,14 @@ cp -R "${FFMPEG_SRC}" "${FFMPEG_BUILD}"
       --disable-securetransport \
       --disable-videotoolbox \
       --disable-xlib \
+      --enable-zlib \
       --enable-audiotoolbox \
       --enable-libmp3lame \
+      --enable-decoder=png \
+      --enable-encoder=png \
       --extra-cflags="-arch arm64 -mmacosx-version-min=${DEPLOYMENT_TARGET} -I${LAME_INSTALL}/include" \
       --extra-ldflags="-arch arm64 -mmacosx-version-min=${DEPLOYMENT_TARGET} -L${LAME_INSTALL}/lib" \
-      --extra-libs="-lm"
+      --extra-libs="-lm -lz"
   make -j"${MAKE_JOBS}" ffmpeg
 )
 

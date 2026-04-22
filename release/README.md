@@ -9,10 +9,10 @@ This directory holds the packaged assets for the current release.
 
 ## Files
 
-- `rekordport_0.2.3_windows.exe`
-- `rekordport_0.2.3_macos_arm64.dmg`
-- `rekordport_0.2.3_macos_x64.dmg`
-- `SHA256SUMS-v0.2.3.txt`
+- `rekordport_0.2.5_windows.exe`
+- `rekordport_0.2.5_macos_arm64.dmg`
+- `rekordport_0.2.5_macos_x64.dmg`
+- `SHA256SUMS-v0.2.5.txt`
 
 ## Notes
 

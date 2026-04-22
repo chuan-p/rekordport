@@ -165,6 +165,7 @@ struct PreflightResponse {
     sqlcipher_source: Option<String>,
     ffmpeg_source: Option<String>,
     m4a_encoder_available: bool,
+    png_encoder_available: bool,
     db_path: String,
     db_exists: bool,
     db_readable: bool,
@@ -541,6 +542,7 @@ fn tool_override_var(command: &str) -> Option<&'static str> {
     match command {
         "sqlcipher" => Some("RKB_SQLCIPHER_PATH"),
         "ffmpeg" => Some("RKB_FFMPEG_PATH"),
+        "ffprobe" => Some("RKB_FFPROBE_PATH"),
         _ => None,
     }
 }
@@ -2049,6 +2051,251 @@ fn rewrite_anlz_ppth(path: &Path, file_name: &str) -> Result<(), String> {
     write_path(path, bytes)
 }
 
+fn read_u32_be(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)
+        .map(|slice| u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn write_u32_be(bytes: &mut [u8], offset: usize, value: u32) -> bool {
+    let Some(slice) = bytes.get_mut(offset..offset + 4) else {
+        return false;
+    };
+    slice.copy_from_slice(&value.to_be_bytes());
+    true
+}
+
+fn add_ms_to_u32_be(bytes: &mut [u8], offset: usize, offset_ms: u32, skip_max: bool) -> bool {
+    let Some(value) = read_u32_be(bytes, offset) else {
+        return false;
+    };
+    if skip_max && value == u32::MAX {
+        return false;
+    }
+    write_u32_be(bytes, offset, value.saturating_add(offset_ms))
+}
+
+fn compensate_anlz_aac_priming(path: &Path, offset_ms: u32) -> Result<bool, String> {
+    if offset_ms == 0 {
+        return Ok(false);
+    }
+
+    let mut bytes = read_path(path)?;
+    if bytes.len() < 12 || &bytes[0..4] != b"PMAI" {
+        return Ok(false);
+    }
+
+    let mut changed = false;
+    let mut offset = read_u32_be(&bytes, 4).unwrap_or(0) as usize;
+    while offset + 12 <= bytes.len() {
+        let tag_type = bytes[offset..offset + 4].to_vec();
+        let header_len = read_u32_be(&bytes, offset + 4).unwrap_or(0) as usize;
+        let tag_len = read_u32_be(&bytes, offset + 8).unwrap_or(0) as usize;
+        if header_len < 12 || tag_len < header_len || offset + tag_len > bytes.len() {
+            return Err(format!("invalid ANLZ tag in {}", path.display()));
+        }
+
+        match tag_type.as_slice() {
+            b"PQTZ" if header_len >= 24 => {
+                let entry_count = read_u32_be(&bytes, offset + 20).unwrap_or(0) as usize;
+                let entries_start = offset + 24;
+                for index in 0..entry_count {
+                    let time_offset = entries_start + index * 8 + 4;
+                    if time_offset + 4 <= offset + tag_len {
+                        changed |= add_ms_to_u32_be(&mut bytes, time_offset, offset_ms, false);
+                    }
+                }
+            }
+            b"PQT2" if header_len >= 56 => {
+                for index in 0..2 {
+                    let time_offset = offset + 24 + index * 8 + 4;
+                    if time_offset + 4 <= offset + header_len {
+                        changed |= add_ms_to_u32_be(&mut bytes, time_offset, offset_ms, false);
+                    }
+                }
+            }
+            b"PCOB" if header_len >= 24 => {
+                let entry_count = bytes
+                    .get(offset + 18..offset + 20)
+                    .map(|slice| u16::from_be_bytes([slice[0], slice[1]]) as usize)
+                    .unwrap_or(0);
+                let mut entry_offset = offset + 24;
+                for _ in 0..entry_count {
+                    if entry_offset + 40 > offset + tag_len
+                        || bytes.get(entry_offset..entry_offset + 4) != Some(&b"PCPT"[..])
+                    {
+                        break;
+                    }
+                    let entry_len = read_u32_be(&bytes, entry_offset + 8).unwrap_or(0) as usize;
+                    if entry_len < 40 || entry_offset + entry_len > offset + tag_len {
+                        break;
+                    }
+                    changed |= add_ms_to_u32_be(&mut bytes, entry_offset + 32, offset_ms, false);
+                    changed |= add_ms_to_u32_be(&mut bytes, entry_offset + 36, offset_ms, true);
+                    entry_offset += entry_len;
+                }
+            }
+            b"PCO2" if header_len >= 20 => {
+                let entry_count = bytes
+                    .get(offset + 16..offset + 18)
+                    .map(|slice| u16::from_be_bytes([slice[0], slice[1]]) as usize)
+                    .unwrap_or(0);
+                let mut entry_offset = offset + 20;
+                for _ in 0..entry_count {
+                    if entry_offset + 28 > offset + tag_len
+                        || bytes.get(entry_offset..entry_offset + 4) != Some(&b"PCP2"[..])
+                    {
+                        break;
+                    }
+                    let entry_len = read_u32_be(&bytes, entry_offset + 8).unwrap_or(0) as usize;
+                    if entry_len < 28 || entry_offset + entry_len > offset + tag_len {
+                        break;
+                    }
+                    changed |= add_ms_to_u32_be(&mut bytes, entry_offset + 20, offset_ms, false);
+                    changed |= add_ms_to_u32_be(&mut bytes, entry_offset + 24, offset_ms, true);
+                    entry_offset += entry_len;
+                }
+            }
+            _ => {}
+        }
+
+        offset += tag_len;
+    }
+
+    if changed {
+        write_path(path, bytes)?;
+    }
+
+    Ok(changed)
+}
+
+fn parse_ffprobe_skip_samples_json(text: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value
+        .get("packets")?
+        .as_array()?
+        .iter()
+        .flat_map(|packet| {
+            packet
+                .get("side_data_list")
+                .and_then(|side| side.as_array())
+        })
+        .flatten()
+        .find_map(|side_data| {
+            side_data
+                .get("skip_samples")
+                .and_then(|samples| samples.as_u64())
+        })
+        .and_then(|samples| u32::try_from(samples).ok())
+}
+
+fn probe_aac_skip_samples(path: &Path) -> Result<Option<u32>, String> {
+    if !command_available("ffprobe") {
+        return Ok(None);
+    }
+
+    let mut ffprobe = prepared_command("ffprobe")?;
+    ffprobe.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_packets",
+        "-read_intervals",
+        "%+0.001",
+        "-show_entries",
+        "packet=side_data_list",
+        "-of",
+        "json",
+    ]);
+    ffprobe.arg(path);
+
+    let output = ffprobe.output().map_err(|e| {
+        io_error_message(
+            &format!("failed to run ffprobe while reading {}", path.display()),
+            &e,
+        )
+    })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    Ok(parse_ffprobe_skip_samples_json(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn samples_to_nearest_ms(samples: u32, sample_rate: u32) -> u32 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    ((u64::from(samples) * 1000) + u64::from(sample_rate / 2))
+        .checked_div(u64::from(sample_rate))
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(u32::MAX)
+}
+
+fn m4a_priming_compensation_ms(output_path: &Path, sample_rate: u32) -> Result<u32, String> {
+    let skip_samples = probe_aac_skip_samples(output_path)?.unwrap_or(2112);
+    Ok(samples_to_nearest_ms(skip_samples, sample_rate))
+}
+
+fn has_column(columns: &[String], column: &str) -> bool {
+    columns.iter().any(|candidate| candidate == column)
+}
+
+fn djmd_cue_migration_sql(
+    columns: &[String],
+    new_content_id_expr: &str,
+    content_uuid: &str,
+    old_content_id: &str,
+    offset_ms: u32,
+    now_expr: &str,
+) -> String {
+    let mut assignments = vec![
+        format!("ContentID = {new_content_id_expr}"),
+        format!("ContentUUID = {}", sql_quote(content_uuid)),
+    ];
+
+    if offset_ms > 0 {
+        let offset_frames = ((u64::from(offset_ms) * 150) + 500) / 1000;
+        let offset_microseconds = u64::from(offset_ms) * 1000;
+        if has_column(columns, "InMsec") {
+            assignments.push(format!(
+                "InMsec = CASE WHEN InMsec >= 0 THEN InMsec + {offset_ms} ELSE InMsec END"
+            ));
+        }
+        if has_column(columns, "OutMsec") {
+            assignments.push(format!(
+                "OutMsec = CASE WHEN OutMsec >= 0 THEN OutMsec + {offset_ms} ELSE OutMsec END"
+            ));
+        }
+        if has_column(columns, "InFrame") {
+            assignments.push(format!(
+                "InFrame = CASE WHEN InFrame >= 0 THEN InFrame + {offset_frames} ELSE InFrame END"
+            ));
+        }
+        if has_column(columns, "OutFrame") {
+            assignments.push(format!(
+                "OutFrame = CASE WHEN OutFrame > 0 THEN OutFrame + {offset_frames} ELSE OutFrame END"
+            ));
+        }
+        if has_column(columns, "CueMicrosec") {
+            assignments.push(format!(
+                "CueMicrosec = CASE WHEN CueMicrosec >= 0 THEN CueMicrosec + {offset_microseconds} ELSE CueMicrosec END"
+            ));
+        }
+    }
+
+    assignments.push(format!("updated_at = {now_expr}"));
+
+    format!(
+        "UPDATE djmdCue SET {} WHERE ContentID = {};\n",
+        assignments.join(", "),
+        sql_quote(old_content_id),
+    )
+}
+
 fn md5_hex(path: &Path) -> Result<String, String> {
     let mut file = open_file_path(path)?;
     let mut context = md5::Context::new();
@@ -2530,6 +2777,7 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     let sqlcipher_source = command_source("sqlcipher");
     let ffmpeg_source = command_source("ffmpeg");
     let m4a_encoder_available = ffmpeg_has_encoder("aac_at").unwrap_or(false);
+    let png_encoder_available = ffmpeg_has_encoder("png").unwrap_or(false);
     let db_exists = !db_path.is_empty() && db_path_buf.exists();
     let db_readable = if db_exists {
         check_database_readable(&db_path_buf, DEFAULT_KEY)
@@ -2555,6 +2803,9 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     if cfg!(target_os = "windows") && !m4a_encoder_available {
         warnings.push("The current ffmpeg build does not include Apple's aac_at encoder, so M4A 320kbps is usually unavailable on Windows.".to_string());
     }
+    if ffmpeg_available && !png_encoder_available {
+        warnings.push("The current ffmpeg build does not include the PNG encoder, so embedded cover art will be skipped during conversion.".to_string());
+    }
 
     let scan_ready = sqlcipher_available && db_readable;
     let convert_ready = ffmpeg_available && sqlcipher_available && db_readable;
@@ -2566,6 +2817,7 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
         sqlcipher_source,
         ffmpeg_source,
         m4a_encoder_available,
+        png_encoder_available,
         db_path,
         db_exists,
         db_readable,
@@ -2664,7 +2916,8 @@ fn convert_one_track(
     backup_root: &Path,
     archive_conflict_resolution: ConflictResolution,
     output_conflict_resolution: ConflictResolution,
-) -> Result<(Track, PathBuf, PathBuf), String> {
+    png_encoder_available: bool,
+) -> Result<(Track, PathBuf, PathBuf, bool), String> {
     let source = Path::new(&track.full_path);
     if !path_exists(source)? {
         return Err(format!("source file not found: {}", source.display()));
@@ -2715,6 +2968,7 @@ fn convert_one_track(
     let temp_output_path = temp_output.path().to_path_buf();
     drop(temp_output);
 
+    let mut skipped_embedded_artwork = false;
     let conversion_result = (|| -> Result<(), String> {
         let cover_art_supported = spec.supports_embedded_artwork();
         let has_attached_pic = if cover_art_supported {
@@ -2735,14 +2989,18 @@ fn convert_one_track(
             spec.ffmpeg_codec,
         ]);
         if has_attached_pic {
-            ffmpeg.args([
-                "-map",
-                "0:v:0?",
-                "-c:v",
-                "png",
-                "-disposition:v:0",
-                "attached_pic",
-            ]);
+            if png_encoder_available {
+                ffmpeg.args([
+                    "-map",
+                    "0:v:0?",
+                    "-c:v",
+                    "png",
+                    "-disposition:v:0",
+                    "attached_pic",
+                ]);
+            } else {
+                skipped_embedded_artwork = true;
+            }
         }
         if spec.extension == "wav" {
             ffmpeg.arg("-vn");
@@ -2852,7 +3110,12 @@ fn convert_one_track(
     converted.bitrate = Some(bitrate);
     converted.full_path = output_path.to_string_lossy().to_string();
 
-    Ok((converted, output_path, archive_path))
+    Ok((
+        converted,
+        output_path,
+        archive_path,
+        skipped_embedded_artwork,
+    ))
 }
 
 fn migrate_tracks_in_db(
@@ -2864,6 +3127,7 @@ fn migrate_tracks_in_db(
 ) -> Result<Vec<Track>, String> {
     let content_columns = table_columns(db_path, key, "djmdContent")?;
     let insert_columns = content_columns;
+    let djmd_cue_columns = table_columns(db_path, key, "djmdCue").unwrap_or_default();
     let now_expr = "strftime('%Y-%m-%d %H:%M:%f +00:00','now')";
     let mut copied_resources: Vec<PathBuf> = Vec::new();
     let result = (|| -> Result<Vec<Track>, String> {
@@ -2890,6 +3154,14 @@ fn migrate_tracks_in_db(
                 .to_string();
             let folder_path = output_path.to_string_lossy().to_string();
             let file_size = metadata_path(output_path)?.len();
+            let aac_priming_offset_ms = if spec.extension == "m4a" {
+                m4a_priming_compensation_ms(
+                    output_path,
+                    output_track.sample_rate.unwrap_or(44_100),
+                )?
+            } else {
+                0
+            };
             let old_uuid = sqlcipher_required_value(
                 db_path,
                 key,
@@ -2939,6 +3211,7 @@ fn migrate_tracks_in_db(
                         let destination = PathBuf::from(&destination_path);
                         copy_file_with_parent_dirs(&file.source, &destination)?;
                         rewrite_anlz_ppth(&destination, &file_name)?;
+                        compensate_anlz_aac_priming(&destination, aac_priming_offset_ms)?;
                         copied_resources.push(destination.clone());
                         let size = metadata_path(&destination)?.len();
                         let hash = md5_hex(&destination)?;
@@ -3034,11 +3307,14 @@ fn migrate_tracks_in_db(
         file_size,
       ));
 
-            sql.push_str(&format!(
-        "UPDATE djmdCue SET ContentID = {new_content_id_expr}, ContentUUID = {}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&content_uuid),
-        sql_quote(&track.id),
-      ));
+            sql.push_str(&djmd_cue_migration_sql(
+                &djmd_cue_columns,
+                new_content_id_expr,
+                &content_uuid,
+                &track.id,
+                aac_priming_offset_ms,
+                now_expr,
+            ));
             sql.push_str(&format!(
         "UPDATE contentActiveCensor SET ID = REPLACE(ID, {}, {}), ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
         sql_quote(&old_uuid),
@@ -3227,6 +3503,7 @@ where
             "ffmpeg was built without Apple's aac_at encoder, so M4A 320kbps is unavailable".into(),
         );
     }
+    let png_encoder_available = ffmpeg_has_encoder("png").unwrap_or(false);
     ensure_database_writable(&db_path, DEFAULT_KEY)?;
 
     let timestamp = timestamp_token();
@@ -3241,6 +3518,7 @@ where
 
     let music_backup_root = backup_root.join("music");
     let mut session = conversion_session::ConversionSession::new();
+    let mut skipped_embedded_artwork_count = 0usize;
     let total_tracks = req.tracks.len();
 
     on_progress(ScanProgressPayload {
@@ -3264,8 +3542,12 @@ where
             &music_backup_root,
             archive_conflict_resolution,
             output_conflict_resolution,
+            png_encoder_available,
         ) {
-            Ok((converted_track, output_path, archive_path)) => {
+            Ok((converted_track, output_path, archive_path, skipped_embedded_artwork)) => {
+                if skipped_embedded_artwork {
+                    skipped_embedded_artwork_count += 1;
+                }
                 session.push(track, converted_track, output_path, archive_path);
             }
             Err(error) => {
@@ -3293,6 +3575,13 @@ where
         };
 
     let mut warnings = Vec::new();
+    if skipped_embedded_artwork_count > 0 {
+        warnings.push(
+            format!(
+                "Embedded cover art was skipped for {skipped_embedded_artwork_count} converted track(s) because the current ffmpeg build does not include the PNG encoder."
+            ),
+        );
+    }
     let cleanup_report = match cleanup_orphan_zero_analysis_dirs(&db_path, DEFAULT_KEY) {
         Ok(report) => report,
         Err(error) => {
@@ -3873,6 +4162,80 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
                 "D:/PIONEER/Master/share/PIONEER/USBANLZ/111/11111-2222-3333-4444-555555555555/ANLZ0000.2EX"
             )
         );
+    }
+
+    #[test]
+    fn parses_ffprobe_skip_samples_side_data() {
+        let text = r#"{
+          "packets": [
+            {
+              "side_data_list": [
+                {
+                  "side_data_type": "Skip Samples",
+                  "skip_samples": 2112,
+                  "discard_padding": 0
+                }
+              ]
+            }
+          ]
+        }"#;
+
+        assert_eq!(parse_ffprobe_skip_samples_json(text), Some(2112));
+        assert_eq!(samples_to_nearest_ms(2112, 44_100), 48);
+        assert_eq!(samples_to_nearest_ms(2112, 48_000), 44);
+    }
+
+    #[test]
+    fn compensates_anlz_grid_and_cue_times() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let path = dir.path().join("ANLZ0000.DAT");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PMAI");
+        bytes.extend_from_slice(&28_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+
+        bytes.extend_from_slice(b"PQTZ");
+        bytes.extend_from_slice(&24_u32.to_be_bytes());
+        bytes.extend_from_slice(&32_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0x0008_0000_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&12_800_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_000_u32.to_be_bytes());
+
+        bytes.extend_from_slice(b"PCOB");
+        bytes.extend_from_slice(&24_u32.to_be_bytes());
+        bytes.extend_from_slice(&80_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&(-1_i32).to_be_bytes());
+        bytes.extend_from_slice(b"PCPT");
+        bytes.extend_from_slice(&28_u32.to_be_bytes());
+        bytes.extend_from_slice(&56_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        bytes.extend_from_slice(&0xffff_u16.to_be_bytes());
+        bytes.extend_from_slice(&0xffff_u16.to_be_bytes());
+        bytes.push(1);
+        bytes.push(0);
+        bytes.extend_from_slice(&1_000_u16.to_be_bytes());
+        bytes.extend_from_slice(&2_000_u32.to_be_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+
+        let file_len = bytes.len() as u32;
+        bytes[8..12].copy_from_slice(&file_len.to_be_bytes());
+        fs::write(&path, bytes).expect("analysis fixture should be written");
+
+        assert!(compensate_anlz_aac_priming(&path, 48).expect("compensation should succeed"));
+        let updated = fs::read(&path).expect("analysis fixture should be readable");
+        assert_eq!(read_u32_be(&updated, 56), Some(1_048));
+        assert_eq!(read_u32_be(&updated, 116), Some(2_048));
+        assert_eq!(read_u32_be(&updated, 120), Some(u32::MAX));
     }
 
     #[test]
