@@ -2075,7 +2075,7 @@ fn add_ms_to_u32_be(bytes: &mut [u8], offset: usize, offset_ms: u32, skip_max: b
     write_u32_be(bytes, offset, value.saturating_add(offset_ms))
 }
 
-fn compensate_anlz_aac_priming(path: &Path, offset_ms: u32) -> Result<bool, String> {
+fn compensate_anlz_encoder_priming(path: &Path, offset_ms: u32) -> Result<bool, String> {
     if offset_ms == 0 {
         return Ok(false);
     }
@@ -2189,7 +2189,7 @@ fn parse_ffprobe_skip_samples_json(text: &str) -> Option<u32> {
         .and_then(|samples| u32::try_from(samples).ok())
 }
 
-fn probe_aac_skip_samples(path: &Path) -> Result<Option<u32>, String> {
+fn probe_skip_samples(path: &Path) -> Result<Option<u32>, String> {
     if !command_available("ffprobe") {
         return Ok(None);
     }
@@ -2235,8 +2235,19 @@ fn samples_to_nearest_ms(samples: u32, sample_rate: u32) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-fn m4a_priming_compensation_ms(output_path: &Path, sample_rate: u32) -> Result<u32, String> {
-    let skip_samples = probe_aac_skip_samples(output_path)?.unwrap_or(2112);
+fn encoder_priming_compensation_ms(
+    extension: &str,
+    output_path: &Path,
+    sample_rate: u32,
+) -> Result<u32, String> {
+    let Some(default_skip_samples) = (match extension {
+        "m4a" => Some(2112),
+        "mp3" => Some(1105),
+        _ => None,
+    }) else {
+        return Ok(0);
+    };
+    let skip_samples = probe_skip_samples(output_path)?.unwrap_or(default_skip_samples);
     Ok(samples_to_nearest_ms(skip_samples, sample_rate))
 }
 
@@ -3154,14 +3165,11 @@ fn migrate_tracks_in_db(
                 .to_string();
             let folder_path = output_path.to_string_lossy().to_string();
             let file_size = metadata_path(output_path)?.len();
-            let aac_priming_offset_ms = if spec.extension == "m4a" {
-                m4a_priming_compensation_ms(
-                    output_path,
-                    output_track.sample_rate.unwrap_or(44_100),
-                )?
-            } else {
-                0
-            };
+            let encoder_priming_offset_ms = encoder_priming_compensation_ms(
+                spec.extension,
+                output_path,
+                output_track.sample_rate.unwrap_or(44_100),
+            )?;
             let old_uuid = sqlcipher_required_value(
                 db_path,
                 key,
@@ -3211,7 +3219,7 @@ fn migrate_tracks_in_db(
                         let destination = PathBuf::from(&destination_path);
                         copy_file_with_parent_dirs(&file.source, &destination)?;
                         rewrite_anlz_ppth(&destination, &file_name)?;
-                        compensate_anlz_aac_priming(&destination, aac_priming_offset_ms)?;
+                        compensate_anlz_encoder_priming(&destination, encoder_priming_offset_ms)?;
                         copied_resources.push(destination.clone());
                         let size = metadata_path(&destination)?.len();
                         let hash = md5_hex(&destination)?;
@@ -3312,7 +3320,7 @@ fn migrate_tracks_in_db(
                 new_content_id_expr,
                 &content_uuid,
                 &track.id,
-                aac_priming_offset_ms,
+                encoder_priming_offset_ms,
                 now_expr,
             ));
             sql.push_str(&format!(
@@ -4183,6 +4191,8 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
         assert_eq!(parse_ffprobe_skip_samples_json(text), Some(2112));
         assert_eq!(samples_to_nearest_ms(2112, 44_100), 48);
         assert_eq!(samples_to_nearest_ms(2112, 48_000), 44);
+        assert_eq!(samples_to_nearest_ms(1105, 44_100), 25);
+        assert_eq!(samples_to_nearest_ms(1105, 48_000), 23);
     }
 
     #[test]
@@ -4231,7 +4241,7 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
         bytes[8..12].copy_from_slice(&file_len.to_be_bytes());
         fs::write(&path, bytes).expect("analysis fixture should be written");
 
-        assert!(compensate_anlz_aac_priming(&path, 48).expect("compensation should succeed"));
+        assert!(compensate_anlz_encoder_priming(&path, 48).expect("compensation should succeed"));
         let updated = fs::read(&path).expect("analysis fixture should be readable");
         assert_eq!(read_u32_be(&updated, 56), Some(1_048));
         assert_eq!(read_u32_be(&updated, 116), Some(2_048));
