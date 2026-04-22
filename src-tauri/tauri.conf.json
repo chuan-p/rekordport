@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/tauri-schema.json",
   "productName": "rekordport",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "identifier": "com.chuan.rekordboxlosslessscan",
   "build": {
     "beforeDevCommand": "npm run dev",
