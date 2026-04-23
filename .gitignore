@@ -16,6 +16,7 @@ release/*-setup.exe
 release/*.exe.zip
 release/*.dmg
 release/*.msi
+release/*.app/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/tauri.generated.conf.json
