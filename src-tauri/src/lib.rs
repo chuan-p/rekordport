@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -743,6 +747,28 @@ fn copy_path(source: &Path, destination: &Path) -> Result<u64, String> {
     )
 }
 
+fn duplicate_path_best_effort(source: &Path, destination: &Path) -> Result<(), String> {
+    retry_io_operation(
+        format!(
+            "failed to duplicate {} -> {}",
+            source.display(),
+            destination.display()
+        ),
+        || {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            if fs::hard_link(source, destination).is_ok() {
+                return Ok(());
+            }
+
+            fs::copy(source, destination)?;
+            Ok(())
+        },
+    )
+}
+
 fn remove_file_path(path: &Path) -> Result<(), String> {
     retry_io_operation(format!("failed to remove {}", path.display()), || {
         fs::remove_file(path)
@@ -1415,18 +1441,6 @@ fn probe_audio(path: &Path) -> Result<AudioProbe, String> {
     Ok(probe)
 }
 
-fn probe_channels(path: &Path) -> Result<u32, String> {
-    Ok(probe_audio(path)?.channels.unwrap_or(2))
-}
-
-fn probe_sample_rate(path: &Path) -> Result<Option<u32>, String> {
-    Ok(probe_audio(path)?.sample_rate)
-}
-
-fn probe_bitrate(path: &Path) -> Result<Option<u32>, String> {
-    Ok(probe_audio(path)?.bitrate_kbps)
-}
-
 fn target_sample_rate_for_source(sample_rate: Option<u32>) -> u32 {
     let source = sample_rate.unwrap_or(44_100);
     match source {
@@ -1511,27 +1525,28 @@ fn compute_pcm_bitrate(sample_rate: u32, channels: u32, bit_depth: u32) -> u32 {
     (((sample_rate as u64) * (channels as u64) * (bit_depth as u64)) / 1000) as u32
 }
 
-fn source_bitrate_kbps(track: &Track, source: &Path) -> Result<u32, String> {
+fn source_bitrate_kbps(track: &Track, source_probe: &AudioProbe) -> u32 {
     if let Some(value) = track.bitrate {
         if value > 0 {
-            return Ok(value);
+            return value;
         }
     }
 
     if matches!(track.file_type.as_str(), "WAV" | "AIFF") {
-        let sample_rate = probe_sample_rate(source)?
+        let sample_rate = source_probe
+            .sample_rate
             .or(track.sample_rate)
             .unwrap_or(44_100);
-        let channels = probe_channels(source)?;
+        let channels = source_probe.channels.unwrap_or(2);
         let bit_depth = track.bit_depth.unwrap_or(16);
-        return Ok(compute_pcm_bitrate(sample_rate, channels, bit_depth));
+        return compute_pcm_bitrate(sample_rate, channels, bit_depth);
     }
 
-    if let Some(value) = probe_bitrate(source)? {
-        return Ok(value);
+    if let Some(value) = source_probe.bitrate_kbps {
+        return value;
     }
 
-    Ok(track.bitrate.unwrap_or(0))
+    track.bitrate.unwrap_or(0)
 }
 
 fn run_sqlcipher(db_path: &Path, key: &str, sql: &str) -> Result<String, String> {
@@ -2173,7 +2188,33 @@ fn fetch_content_files(
     Ok(files)
 }
 
-fn copy_file_with_parent_dirs(source: &Path, destination: &Path) -> Result<(), String> {
+#[cfg(target_os = "macos")]
+fn clone_file_on_macos(source: &Path, destination: &Path) -> Result<bool, String> {
+    use std::os::raw::{c_char, c_int};
+
+    extern "C" {
+        fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> c_int;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|error| format!("failed to prepare clone source path: {}", error))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|error| format!("failed to prepare clone destination path: {}", error))?;
+
+    let result = unsafe { clonefile(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_file_on_macos(_source: &Path, _destination: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+fn duplicate_file_with_parent_dirs(source: &Path, destination: &Path) -> Result<(), String> {
     if !path_exists(source)? {
         return Err(format!("source resource not found: {}", source.display()));
     }
@@ -2186,7 +2227,9 @@ fn copy_file_with_parent_dirs(source: &Path, destination: &Path) -> Result<(), S
     if let Some(parent) = destination.parent() {
         create_dir_all_path(parent)?;
     }
-    copy_path(source, destination)?;
+    if !clone_file_on_macos(source, destination)? {
+        copy_path(source, destination)?;
+    }
     Ok(())
 }
 
@@ -3150,10 +3193,7 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
 fn backup_file_tree(source: &Path, backup_root: &Path) -> Result<PathBuf, String> {
     let relative = backup_relative_path(source);
     let target = backup_root.join(relative);
-    if let Some(parent) = target.parent() {
-        create_dir_all_path(parent)?;
-    }
-    copy_path(source, &target)?;
+    duplicate_path_best_effort(source, &target)?;
     Ok(target)
 }
 
@@ -3243,9 +3283,10 @@ fn convert_one_track(
         return Err(format!("source file not found: {}", source.display()));
     }
 
-    let source_sample_rate = probe_sample_rate(source)?.or(track.sample_rate);
+    let source_probe = probe_audio(source)?;
+    let source_sample_rate = source_probe.sample_rate.or(track.sample_rate);
     let target_sample_rate = target_sample_rate_for_source(source_sample_rate);
-    let source_bitrate = source_bitrate_kbps(track, source)?;
+    let source_bitrate = source_bitrate_kbps(track, &source_probe);
     let mut archive_path =
         build_source_archive_path(source, source_bitrate, archive_conflict_resolution)?;
     let mut output_path = build_target_path(source, spec, output_conflict_resolution)?;
@@ -3300,11 +3341,7 @@ fn convert_one_track(
     let mut skipped_embedded_artwork = false;
     let conversion_result = (|| -> Result<(), String> {
         let cover_art_supported = spec.supports_embedded_artwork();
-        let has_attached_pic = if cover_art_supported {
-            probe_audio(&archive_path)?.has_attached_pic
-        } else {
-            false
-        };
+        let has_attached_pic = cover_art_supported && source_probe.has_attached_pic;
 
         let mut ffmpeg = prepared_command("ffmpeg")?;
         ffmpeg.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]);
@@ -3415,7 +3452,7 @@ fn convert_one_track(
         return Err(error);
     }
 
-    let channels = probe_channels(&archive_path)?;
+    let channels = source_probe.channels.unwrap_or(2);
     let sample_rate = if spec.extension == "mp3" {
         source_sample_rate.unwrap_or_else(|| track.sample_rate.unwrap_or(44_100))
     } else {
@@ -3526,7 +3563,7 @@ fn migrate_tracks_in_db(
                             &content_uuid,
                         );
                         let destination = PathBuf::from(&destination_path);
-                        copy_file_with_parent_dirs(&file.source, &destination)?;
+                        duplicate_file_with_parent_dirs(&file.source, &destination)?;
                         rewrite_anlz_ppth(&destination, &file_name)?;
                         compensate_anlz_encoder_priming(&destination, encoder_priming_offset_ms)?;
                         copied_resources.push(destination.clone());
@@ -3873,39 +3910,6 @@ where
             Ok((converted_track, output_path, archive_path, skipped_embedded_artwork)) => {
                 if skipped_embedded_artwork {
                     skipped_embedded_artwork_count += 1;
-                }
-                if let Err(error) = conversion_session::append_manifest_entry(
-                    &backup_root,
-                    &conversion_session::ConversionManifestEntry {
-                        track_id: track.id.clone(),
-                        source_path: track.full_path.clone(),
-                        archive_path: archive_path.to_string_lossy().to_string(),
-                        output_path: output_path.to_string_lossy().to_string(),
-                    },
-                ) {
-                    let mut rollback_errors = Vec::new();
-                    if let Err(rollback_error) = remove_file_path(&output_path) {
-                        rollback_errors.push(format!(
-                            "failed to remove converted output {} after manifest append failed: {}",
-                            output_path.display(),
-                            rollback_error
-                        ));
-                    }
-                    if let Err(rollback_error) =
-                        rename_path(&archive_path, Path::new(&track.full_path))
-                    {
-                        rollback_errors.push(format!(
-                            "failed to restore archived source {} -> {} after manifest append failed: {}",
-                            archive_path.display(),
-                            track.full_path,
-                            rollback_error
-                        ));
-                    }
-                    rollback_errors.extend(session.rollback_all());
-                    if rollback_errors.is_empty() {
-                        let _ = conversion_session::remove_manifest(&backup_root);
-                    }
-                    return Err(append_rollback_errors(error, rollback_errors));
                 }
                 session.push(track, converted_track, output_path, archive_path);
             }
@@ -4647,6 +4651,48 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
             build_target_path(&source, &spec, ConflictResolution::Error).expect("target path");
 
         assert_eq!(target, source);
+    }
+
+    #[test]
+    fn backups_source_files_using_best_effort_duplication() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("music/track.flac");
+        let backup_root = dir.path().join("backup");
+        fs::create_dir_all(source.parent().expect("source parent should exist"))
+            .expect("source parent should be created");
+        fs::write(&source, b"source audio").expect("source fixture should be written");
+
+        let backup = backup_file_tree(&source, &backup_root).expect("backup should succeed");
+
+        assert_eq!(
+            fs::read(&backup).expect("backup should be readable"),
+            b"source audio"
+        );
+        assert!(backup.exists());
+        assert!(backup.starts_with(&backup_root));
+    }
+
+    #[test]
+    fn duplicates_analysis_resources_without_mutating_source() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("analysis/ANLZ0001.DAT");
+        let destination = dir.path().join("copy/ANLZ0001.DAT");
+        fs::create_dir_all(source.parent().expect("source parent should exist"))
+            .expect("source parent should be created");
+        fs::write(&source, b"original analysis").expect("source fixture should be written");
+
+        duplicate_file_with_parent_dirs(&source, &destination)
+            .expect("analysis resource duplication should succeed");
+        fs::write(&destination, b"rewritten analysis").expect("destination should be writable");
+
+        assert_eq!(
+            fs::read(&source).expect("source should remain readable"),
+            b"original analysis"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("destination should remain readable"),
+            b"rewritten analysis"
+        );
     }
 
     #[test]
