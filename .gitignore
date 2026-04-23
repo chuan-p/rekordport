@@ -1,11 +1,13 @@
 node_modules/
 dist/
 .codex/
+.codex-output/
 exports/
 __pycache__/
 *.pyc
 .env
 .env.*
+release/
 release/windows-x64-portable/
 release/icon-drafts/
 release/*-portable.zip

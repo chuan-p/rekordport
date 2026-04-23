@@ -1,2 +1,0 @@
-1e6f5c88ff7f8a368438687136fc8d1ee5cc602a2c39a96efe9f1042f1310291  release/rekordport-macos-arm64-0.2.3-2026-04-20.dmg
-fbdf9ef7008934f67ab4f7e2a237cd8067ad9ea98088c5ac64f49e646f91332a  release/rekordport-macos-intel-0.2.3-2026-04-20.dmg

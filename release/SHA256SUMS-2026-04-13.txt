@@ -1,3 +1,0 @@
-a0a34f66e223b427ec78e6d8a97f8ac4cb7ffebfa64a999b74d716299f9db5cd  release/rekordport-macos-arm64-2026-04-13.dmg
-d2b5bfa2947af7bce125ed59cf6dce4eb14829be425720bd4c57a9332e3b1c8e  release/rekordport-macos-intel-2026-04-13.dmg
-cc4a3ae9b181031019f821c64506458d045b2608fc64251923f2c061cfc19ddc  release/rekordport.exe
