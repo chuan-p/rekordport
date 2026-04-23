@@ -65,18 +65,6 @@ The desktop app requires one of these setups:
 - `sqlcipher` and `ffmpeg` available in your system `PATH`
 - Or platform sidecars placed in `src-tauri/bin`
 
-## CLI
-
-The original Python scanner is still available:
-
-```bash
-python3 rekordbox_lossless_scan.py --format table
-python3 rekordbox_lossless_scan.py --format csv
-python3 rekordbox_lossless_scan.py --output report.xlsx
-python3 rekordbox_lossless_scan.py --include-sampler
-python3 rekordbox_lossless_scan.py --min-bit-depth 24
-```
-
 ## Build And Checks
 
 Run the standard project checks:
@@ -159,7 +147,6 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the currently pinned ar
 
 - `src/`: frontend UI
 - `src-tauri/`: Rust backend and packaging config
-- `rekordbox_lossless_scan.py`: original CLI scanner
 - `tools/`: helper scripts for local builds and sidecar preparation
 
 ## Contributing

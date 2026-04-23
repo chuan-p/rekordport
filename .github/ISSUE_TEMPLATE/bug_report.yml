@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem in the app, CLI, or build flow
+description: Report a reproducible problem in the app or build flow
 title: "[Bug]: "
 labels:
   - bug
@@ -18,7 +18,6 @@ body:
       description: Which part of the project is affected?
       options:
         - Desktop app
-        - Python CLI
         - Windows build / packaging
         - macOS build / packaging
         - Documentation
