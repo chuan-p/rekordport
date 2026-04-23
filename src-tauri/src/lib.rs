@@ -1594,12 +1594,54 @@ fn sqlcipher_required_value(
     sqlcipher_single_value(db_path, key, sql)?.ok_or_else(|| error.to_string())
 }
 
-fn table_columns(db_path: &Path, key: &str, table: &str) -> Result<Vec<String>, String> {
-    let sql = format!("PRAGMA table_info({table});");
-    let lines = sqlcipher_lines(db_path, key, &sql)?;
-    Ok(lines
+fn table_columns_map(
+    db_path: &Path,
+    key: &str,
+    tables: &[&str],
+) -> Result<HashMap<String, Vec<String>>, String> {
+    if tables.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let sql = format!(
+        ".headers on\n.mode csv\n{}\nORDER BY table_name, cid;",
+        tables
+            .iter()
+            .map(|table| format!(
+                "SELECT {} AS table_name, cid, name FROM pragma_table_info({})",
+                sql_quote(table),
+                sql_quote(table)
+            ))
+            .collect::<Vec<_>>()
+            .join("\nUNION ALL\n")
+    );
+
+    let mut columns: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for record in sqlcipher_csv_records(db_path, key, &sql)? {
+        let table_name = record.get(0).unwrap_or_default().to_string();
+        let cid = record
+            .get(1)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("missing column ordinal for table {table_name}"))?
+            .parse::<usize>()
+            .map_err(|error| error.to_string())?;
+        let name = record.get(2).unwrap_or_default().to_string();
+        columns.entry(table_name).or_default().push((cid, name));
+    }
+
+    Ok(columns
         .into_iter()
-        .filter_map(|line| line.split('|').nth(1).map(|value| value.to_string()))
+        .map(|(table_name, mut table_columns)| {
+            table_columns.sort_by_key(|(cid, _)| *cid);
+            (
+                table_name,
+                table_columns
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect())
 }
 
@@ -2456,6 +2498,7 @@ fn djmd_cue_migration_sql(
     )
 }
 
+#[allow(dead_code)]
 fn rewrite_content_cues_json(
     text: &str,
     old_content_id: &str,
@@ -2498,6 +2541,7 @@ fn rewrite_content_cues_json(
     Ok((rewritten, cue_count))
 }
 
+#[allow(dead_code)]
 fn rewrite_content_cues_value(
     value: &mut serde_json::Value,
     old_content_id: &str,
@@ -3053,6 +3097,13 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
                     error
                 )),
             }
+            match conversion_session::cleanup_completed_conversion_backups(backup_parent) {
+                Ok(report) => warnings.extend(report.warnings),
+                Err(error) => warnings.push(format!(
+                    "failed to clean completed conversion backups while checking this library: {}",
+                    error
+                )),
+            }
         }
     }
     if !sqlcipher_available {
@@ -3200,6 +3251,15 @@ fn convert_one_track(
     let mut output_path = build_target_path(source, spec, output_conflict_resolution)?;
 
     backup_file_tree(source, backup_root)?;
+    conversion_session::append_manifest_entry(
+        backup_root,
+        &conversion_session::ConversionManifestEntry {
+            track_id: track.id.clone(),
+            source_path: track.full_path.clone(),
+            archive_path: archive_path.to_string_lossy().to_string(),
+            output_path: output_path.to_string_lossy().to_string(),
+        },
+    )?;
 
     if path_exists(&archive_path)? {
         match archive_conflict_resolution {
@@ -3394,9 +3454,13 @@ fn migrate_tracks_in_db(
     key: &str,
     spec: &ConversionSpec,
 ) -> Result<Vec<Track>, String> {
-    let content_columns = table_columns(db_path, key, "djmdContent")?;
+    let schema_columns = table_columns_map(db_path, key, &["djmdContent", "djmdCue"])?;
+    let content_columns = schema_columns
+        .get("djmdContent")
+        .cloned()
+        .ok_or_else(|| "missing djmdContent schema".to_string())?;
     let insert_columns = content_columns;
-    let djmd_cue_columns = table_columns(db_path, key, "djmdCue").unwrap_or_default();
+    let djmd_cue_columns = schema_columns.get("djmdCue").cloned().unwrap_or_default();
     let now_expr = "strftime('%Y-%m-%d %H:%M:%f +00:00','now')";
     let mut copied_resources: Vec<PathBuf> = Vec::new();
     let result = (|| -> Result<Vec<Track>, String> {
@@ -3408,14 +3472,6 @@ fn migrate_tracks_in_db(
         sql.push_str("INSERT INTO migration_state (next_id) SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdContent WHERE ID GLOB '[0-9]*';\n");
         sql.push_str("CREATE TEMP TABLE IF NOT EXISTS migration_results (source_id TEXT NOT NULL, new_id TEXT NOT NULL, new_uuid TEXT NOT NULL);\n");
         sql.push_str("DELETE FROM migration_results;\n");
-        let mut next_content_id = sqlcipher_required_value(
-            db_path,
-            key,
-            "SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdContent WHERE ID GLOB '[0-9]*';",
-            "failed to allocate new content ids",
-        )?
-        .parse::<u64>()
-        .map_err(|error| format!("failed to parse next content id: {}", error))?;
 
         let new_content_id_expr = "(SELECT CAST(next_id AS TEXT) FROM migration_state LIMIT 1)";
         let mut analysis_summaries: Vec<(String, String)> = Vec::with_capacity(tracks.len());
@@ -3423,10 +3479,6 @@ fn migrate_tracks_in_db(
         let source_data_map = fetch_track_migration_source_data_map(db_path, key, &track_ids)?;
 
         for (track, output_track) in tracks.iter().zip(output_tracks.iter()) {
-            let migrated_content_id = next_content_id.to_string();
-            next_content_id = next_content_id
-                .checked_add(1)
-                .ok_or_else(|| "content id allocation overflowed".to_string())?;
             let output_path = Path::new(&output_track.full_path);
             let file_name = output_path
                 .file_name()
@@ -3632,58 +3684,6 @@ fn migrate_tracks_in_db(
         sql_quote(&track.id),
         sql_quote(&track.id),
       ));
-
-            let content_cue_count = sqlcipher_single_value(
-                db_path,
-                key,
-                &format!(
-                    "SELECT COUNT(*) FROM contentCue WHERE ContentID = {} LIMIT 1;",
-                    sql_quote(&track.id)
-                ),
-            )?
-            .unwrap_or_default();
-            if content_cue_count.parse::<u32>().unwrap_or(0) > 0 {
-                let cues_is_null = sqlcipher_required_value(
-                    db_path,
-                    key,
-                    &format!(
-                        "SELECT CASE WHEN Cues IS NULL THEN '1' ELSE '0' END FROM contentCue WHERE ContentID = {} LIMIT 1;",
-                        sql_quote(&track.id)
-                    ),
-                    &format!("missing contentCue JSON for source content {}", track.id),
-                )?;
-                if cues_is_null == "1" {
-                    sql.push_str(&format!(
-                        "UPDATE contentCue SET ID = {}, ContentID = {new_content_id_expr}, Cues = NULL, rb_cue_count = 0, updated_at = {now_expr} WHERE ContentID = {};\n",
-                        sql_quote(&content_uuid),
-                        sql_quote(&track.id),
-                    ));
-                } else {
-                    let cues_text = sqlcipher_required_value(
-                        db_path,
-                        key,
-                        &format!(
-                            "SELECT Cues FROM contentCue WHERE ContentID = {} LIMIT 1;",
-                            sql_quote(&track.id)
-                        ),
-                        &format!("missing contentCue JSON for source content {}", track.id),
-                    )?;
-                    let (rewritten_cues, cue_count) = rewrite_content_cues_json(
-                        &cues_text,
-                        &track.id,
-                        &old_uuid,
-                        &migrated_content_id,
-                        &content_uuid,
-                    )?;
-                    sql.push_str(&format!(
-                        "UPDATE contentCue SET ID = {}, ContentID = {new_content_id_expr}, Cues = {}, rb_cue_count = {}, updated_at = {now_expr} WHERE ContentID = {};\n",
-                        sql_quote(&content_uuid),
-                        sql_quote(&rewritten_cues),
-                        cue_count,
-                        sql_quote(&track.id),
-                    ));
-                }
-            }
             for file in &migrated_content_files {
                 let new_local_path = file.new_local_path.clone().unwrap_or_default();
                 sql.push_str(&format!(
@@ -3823,6 +3823,13 @@ where
                 error
             )),
         }
+        match conversion_session::cleanup_completed_conversion_backups(backup_parent) {
+            Ok(report) => warnings.extend(report.warnings),
+            Err(error) => warnings.push(format!(
+                "failed to clean completed conversion backups before starting: {}",
+                error
+            )),
+        }
     }
 
     let timestamp = timestamp_token();
@@ -3932,6 +3939,21 @@ where
             }
         };
 
+    if let Err(error) = conversion_session::mark_manifest_completed(&backup_root) {
+        warnings.push(format!(
+            "Converted files and database changes were saved, but the completion marker could not be written automatically: {}",
+            error
+        ));
+    }
+    if let Err(error) = conversion_session::remove_manifest(&backup_root) {
+        if !backup_root.join("manifest.completed").exists() {
+            warnings.push(format!(
+                "Converted files and database changes were saved, but the interrupted-conversion manifest could not be removed automatically: {}",
+                error
+            ));
+        }
+    }
+
     if skipped_embedded_artwork_count > 0 {
         warnings.push(
             format!(
@@ -3965,13 +3987,6 @@ where
                 source_cleanup_failures += 1;
             }
         }
-    }
-
-    if let Err(error) = conversion_session::remove_manifest(&backup_root) {
-        warnings.push(format!(
-            "Converted files and database changes were saved, but the interrupted-conversion manifest could not be removed automatically: {}",
-            error
-        ));
     }
 
     let response = ConvertResponse {

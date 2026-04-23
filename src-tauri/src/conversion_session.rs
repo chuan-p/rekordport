@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 
+const COMPLETED_MARKER_NAME: &str = "manifest.completed";
+
 #[derive(Debug)]
 pub(super) struct ConvertedArtifact {
     source_path: PathBuf,
@@ -101,6 +103,10 @@ fn manifest_path(backup_root: &Path) -> PathBuf {
     backup_root.join("manifest.jsonl")
 }
 
+fn completed_marker_path(backup_root: &Path) -> PathBuf {
+    backup_root.join(COMPLETED_MARKER_NAME)
+}
+
 pub(super) fn append_manifest_entry(
     backup_root: &Path,
     entry: &ConversionManifestEntry,
@@ -135,6 +141,26 @@ pub(super) fn remove_manifest(backup_root: &Path) -> Result<(), String> {
     remove_file_path(&manifest)
 }
 
+pub(super) fn mark_manifest_completed(backup_root: &Path) -> Result<(), String> {
+    let marker = completed_marker_path(backup_root);
+    if let Some(parent) = marker.parent() {
+        create_dir_all_path(parent)?;
+    }
+    retry_io_operation(
+        format!("failed to write completion marker {}", marker.display()),
+        || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&marker)?;
+            file.write_all(b"completed\n")?;
+            file.flush()?;
+            Ok(())
+        },
+    )
+}
+
 pub(super) fn stale_conversion_backup_manifests(
     backup_parent: &Path,
 ) -> Result<Vec<PathBuf>, String> {
@@ -162,6 +188,9 @@ pub(super) fn stale_conversion_backup_manifests(
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("rkb-lossless-backup-"))
         {
+            continue;
+        }
+        if path_exists(&completed_marker_path(&path))? {
             continue;
         }
         let manifest = manifest_path(&path);
@@ -195,11 +224,21 @@ fn recover_manifest_entry(entry: &ConversionManifestEntry) -> ConversionRecovery
 
     if archive_exists {
         if source_exists {
-            report.warnings.push(format!(
-                "interrupted conversion left both source and archive on disk for track {}: {}",
-                entry.track_id,
-                source.display()
-            ));
+            if let Err(error) = remove_file_path(&archive) {
+                report.errors.push(format!(
+                    "failed to remove duplicate archived source {} for track {}: {}",
+                    archive.display(),
+                    entry.track_id,
+                    error
+                ));
+            } else {
+                report.warnings.push(format!(
+                    "interrupted conversion left both source and archive on disk for track {}; kept source {} and removed archive {}",
+                    entry.track_id,
+                    source.display(),
+                    archive.display()
+                ));
+            }
         } else if let Err(error) = rename_path(&archive, &source) {
             report.errors.push(format!(
                 "failed to restore archived source {} -> {} for track {}: {}",
@@ -264,6 +303,67 @@ pub(super) fn recover_stale_conversion_backups(
 
         report.warnings.extend(manifest_report.warnings);
         report.errors.extend(manifest_report.errors);
+    }
+
+    Ok(report)
+}
+
+pub(super) fn cleanup_completed_conversion_backups(
+    backup_parent: &Path,
+) -> Result<ConversionRecoveryReport, String> {
+    let mut report = ConversionRecoveryReport::default();
+    if !path_exists(backup_parent)? {
+        return Ok(report);
+    }
+
+    for entry in read_dir_path(backup_parent)? {
+        let entry = entry.map_err(|error| {
+            io_error_message(
+                &format!(
+                    "failed to read backup directory entry in {}",
+                    backup_parent.display()
+                ),
+                &error,
+            )
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rkb-lossless-backup-"))
+        {
+            continue;
+        }
+
+        let marker = completed_marker_path(&path);
+        if !path_exists(&marker)? {
+            continue;
+        }
+
+        let manifest = manifest_path(&path);
+        let mut manifest_removed = true;
+        if path_exists(&manifest)? {
+            if let Err(error) = remove_file_path(&manifest) {
+                report.warnings.push(format!(
+                    "failed to remove completed manifest {}: {}",
+                    manifest.display(),
+                    error
+                ));
+                manifest_removed = false;
+            }
+        }
+        if manifest_removed {
+            if let Err(error) = remove_file_path(&marker) {
+                report.warnings.push(format!(
+                    "failed to remove completion marker {}: {}",
+                    marker.display(),
+                    error
+                ));
+            }
+        }
     }
 
     Ok(report)
@@ -388,5 +488,75 @@ mod tests {
             fs::read(&source).expect("source should be restored"),
             b"archived audio"
         );
+    }
+
+    #[test]
+    fn recover_stale_conversion_backups_removes_duplicate_archive_when_source_is_present() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let source = dir.path().join("track.flac");
+        let archive = backup_root.join("music/track-1000kbps.flac");
+        let output = dir.path().join("track.wav");
+
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("backup directories should be created");
+        fs::write(&source, b"original audio").expect("source fixture should be written");
+        fs::write(&archive, b"duplicate archived audio")
+            .expect("archive fixture should be written");
+        fs::write(&output, b"converted audio").expect("output fixture should be written");
+
+        let entry = ConversionManifestEntry {
+            track_id: "1".to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            output_path: output.to_string_lossy().to_string(),
+        };
+        append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
+
+        let report = recover_stale_conversion_backups(dir.path())
+            .expect("stale conversion backup should be recoverable");
+
+        assert!(report.errors.is_empty());
+        assert!(source.exists());
+        assert!(!archive.exists());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn cleanup_completed_conversion_backups_removes_completed_manifest_files() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let manifest = manifest_path(&backup_root);
+        let marker = completed_marker_path(&backup_root);
+
+        fs::create_dir_all(&backup_root).expect("backup directory should be created");
+        fs::write(&manifest, b"pending").expect("manifest should be written");
+        fs::write(&marker, b"completed").expect("completion marker should be written");
+
+        let report = cleanup_completed_conversion_backups(dir.path())
+            .expect("completed backup cleanup should succeed");
+
+        assert!(report.errors.is_empty());
+        assert!(!manifest.exists());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn cleanup_completed_conversion_backups_keeps_marker_when_manifest_removal_fails() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let manifest = manifest_path(&backup_root);
+        let marker = completed_marker_path(&backup_root);
+
+        fs::create_dir_all(&manifest).expect("manifest directory should be created");
+        fs::create_dir_all(&backup_root).expect("backup directory should be created");
+        fs::write(&marker, b"completed").expect("completion marker should be written");
+
+        let report = cleanup_completed_conversion_backups(dir.path())
+            .expect("completed backup cleanup should succeed");
+
+        assert!(!report.warnings.is_empty());
+        assert!(manifest.exists());
+        assert!(marker.exists());
     }
 }
