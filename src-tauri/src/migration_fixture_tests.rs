@@ -73,6 +73,14 @@ VALUES
   ('1', 'old-uuid', '1', 'Fixture Track', {}, 'track.flac', 'track.flac', '', 5, 24, 1000, 48000, 6, '');
 INSERT INTO djmdPlaylist (ID, SmartList) VALUES ('10', ''), ('11', 'rules');
 INSERT INTO djmdSongPlaylist (ContentID, PlaylistID, updated_at) VALUES ('1', '10', ''), ('1', '11', '');
+INSERT INTO contentCue (ID, ContentID, Cues, rb_cue_count, updated_at)
+VALUES (
+  'old-uuid',
+  '1',
+  '[{{"ContentID":"1","ContentUUID":"old-uuid","CueMsec":41234,"CueName":"Hot Cue"}}]',
+  1,
+  ''
+);
 "#,
             sql_quote(&source_path.to_string_lossy()),
         ),
@@ -114,6 +122,16 @@ INSERT INTO djmdSongPlaylist (ContentID, PlaylistID, updated_at) VALUES ('1', '1
         .first()
         .and_then(|track| track.source_id.as_ref().map(|_| track.id.clone()))
         .expect("migrated track should have a new id");
+    let new_content_uuid = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT UUID FROM djmdContent WHERE ID = {};",
+            sql_quote(&new_id)
+        ),
+        "expected migrated content uuid",
+    )
+    .expect("migrated content uuid query should succeed");
 
     let old_content_count = sqlcipher_required_value(
         &db_path,
@@ -154,6 +172,60 @@ INSERT INTO djmdSongPlaylist (ContentID, PlaylistID, updated_at) VALUES ('1', '1
     assert_eq!(new_content_count, "1");
     assert_eq!(standard_playlist_count, "1");
     assert_eq!(smart_playlist_old_count, "1");
+
+    let migrated_content_cue_id = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT ID FROM contentCue WHERE ContentID = {};",
+            sql_quote(&new_id)
+        ),
+        "expected migrated content cue id",
+    )
+    .expect("migrated content cue id query should succeed");
+    let migrated_content_cue_json = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT Cues FROM contentCue WHERE ContentID = {};",
+            sql_quote(&new_id)
+        ),
+        "expected migrated content cue json",
+    )
+    .expect("migrated content cue json query should succeed");
+    let migrated_content_cue_count = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT rb_cue_count FROM contentCue WHERE ContentID = {};",
+            sql_quote(&new_id)
+        ),
+        "expected migrated content cue count",
+    )
+    .expect("migrated content cue count query should succeed");
+
+    let cues: serde_json::Value = serde_json::from_str(&migrated_content_cue_json)
+        .expect("migrated content cue json should be valid");
+    let cue = cues
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item.as_object())
+        .expect("migrated content cue should be an object inside an array");
+
+    assert_eq!(migrated_content_cue_id, new_content_uuid);
+    assert_eq!(migrated_content_cue_count, "1");
+    assert_eq!(
+        cue.get("ContentID").and_then(|value| value.as_str()),
+        Some(new_id.as_str())
+    );
+    assert_eq!(
+        cue.get("ContentUUID").and_then(|value| value.as_str()),
+        Some(new_content_uuid.as_str())
+    );
+    assert_eq!(
+        cue.get("CueMsec").and_then(|value| value.as_i64()),
+        Some(41_234)
+    );
 }
 
 #[test]

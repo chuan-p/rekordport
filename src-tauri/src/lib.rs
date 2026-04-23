@@ -2307,6 +2307,101 @@ fn djmd_cue_migration_sql(
     )
 }
 
+fn rewrite_content_cues_json(
+    text: &str,
+    old_content_id: &str,
+    old_content_uuid: &str,
+    new_content_id: &str,
+    new_content_uuid: &str,
+) -> Result<(String, usize), String> {
+    let mut value: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+        format!(
+            "invalid contentCue JSON for content {}: {}",
+            old_content_id, error
+        )
+    })?;
+
+    let Some(items) = value.as_array_mut() else {
+        return Err(format!(
+            "contentCue JSON for content {} must be an array",
+            old_content_id
+        ));
+    };
+    let cue_count = items.len();
+
+    for item in &mut *items {
+        let _ = rewrite_content_cues_value(
+            item,
+            old_content_id,
+            old_content_uuid,
+            new_content_id,
+            new_content_uuid,
+        );
+    }
+
+    let rewritten = serde_json::to_string(&value).map_err(|error| {
+        format!(
+            "failed to serialize rewritten contentCue JSON for content {}: {}",
+            old_content_id, error
+        )
+    })?;
+
+    Ok((rewritten, cue_count))
+}
+
+fn rewrite_content_cues_value(
+    value: &mut serde_json::Value,
+    old_content_id: &str,
+    old_content_uuid: &str,
+    new_content_id: &str,
+    new_content_uuid: &str,
+) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut replacements = 0usize;
+            for (key, nested) in map.iter_mut() {
+                match key.as_str() {
+                    "ContentID" => {
+                        if nested.as_str() == Some(old_content_id) {
+                            *nested = serde_json::Value::String(new_content_id.to_string());
+                            replacements += 1;
+                        }
+                    }
+                    "ContentUUID" => {
+                        if nested.as_str() == Some(old_content_uuid) {
+                            *nested = serde_json::Value::String(new_content_uuid.to_string());
+                            replacements += 1;
+                        }
+                    }
+                    _ => {
+                        replacements += rewrite_content_cues_value(
+                            nested,
+                            old_content_id,
+                            old_content_uuid,
+                            new_content_id,
+                            new_content_uuid,
+                        );
+                    }
+                }
+            }
+            replacements
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .map(|item| {
+                rewrite_content_cues_value(
+                    item,
+                    old_content_id,
+                    old_content_uuid,
+                    new_content_id,
+                    new_content_uuid,
+                )
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
 fn md5_hex(path: &Path) -> Result<String, String> {
     let mut file = open_file_path(path)?;
     let mut context = md5::Context::new();
@@ -3150,13 +3245,23 @@ fn migrate_tracks_in_db(
         sql.push_str("INSERT INTO migration_state (next_id) SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdContent WHERE ID GLOB '[0-9]*';\n");
         sql.push_str("CREATE TEMP TABLE IF NOT EXISTS migration_results (source_id TEXT NOT NULL, new_id TEXT NOT NULL);\n");
         sql.push_str("DELETE FROM migration_results;\n");
+        let mut next_content_id = sqlcipher_required_value(
+            db_path,
+            key,
+            "SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdContent WHERE ID GLOB '[0-9]*';",
+            "failed to allocate new content ids",
+        )?
+        .parse::<u64>()
+        .map_err(|error| format!("failed to parse next content id: {}", error))?;
 
         let new_content_id_expr = "(SELECT CAST(next_id AS TEXT) FROM migration_state LIMIT 1)";
-        let new_content_id_text_expr =
-            "(SELECT CAST(next_id AS TEXT) FROM migration_state LIMIT 1)";
         let mut analysis_summaries: Vec<(String, String)> = Vec::with_capacity(tracks.len());
 
         for (track, output_track) in tracks.iter().zip(output_tracks.iter()) {
+            let migrated_content_id = next_content_id.to_string();
+            next_content_id = next_content_id
+                .checked_add(1)
+                .ok_or_else(|| "content id allocation overflowed".to_string())?;
             let output_path = Path::new(&output_track.full_path);
             let file_name = output_path
                 .file_name()
@@ -3376,19 +3481,57 @@ fn migrate_tracks_in_db(
         sql_quote(&track.id),
       ));
 
-            sql.push_str(&format!(
-        "UPDATE contentCue SET ID = {}, ContentID = {new_content_id_expr}, Cues = REPLACE(REPLACE(Cues, {}, {}), {}, {}), rb_cue_count = COALESCE(json_array_length(REPLACE(REPLACE(Cues, {}, {}), {}, {})), 0), updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&content_uuid),
-        sql_quote(&track.id),
-        new_content_id_text_expr,
-        sql_quote(&old_uuid),
-        sql_quote(&content_uuid),
-        sql_quote(&track.id),
-        new_content_id_text_expr,
-        sql_quote(&old_uuid),
-        sql_quote(&content_uuid),
-        sql_quote(&track.id),
-      ));
+            let content_cue_count = sqlcipher_single_value(
+                db_path,
+                key,
+                &format!(
+                    "SELECT COUNT(*) FROM contentCue WHERE ContentID = {} LIMIT 1;",
+                    sql_quote(&track.id)
+                ),
+            )?
+            .unwrap_or_default();
+            if content_cue_count.parse::<u32>().unwrap_or(0) > 0 {
+                let cues_is_null = sqlcipher_required_value(
+                    db_path,
+                    key,
+                    &format!(
+                        "SELECT CASE WHEN Cues IS NULL THEN '1' ELSE '0' END FROM contentCue WHERE ContentID = {} LIMIT 1;",
+                        sql_quote(&track.id)
+                    ),
+                    &format!("missing contentCue JSON for source content {}", track.id),
+                )?;
+                if cues_is_null == "1" {
+                    sql.push_str(&format!(
+                        "UPDATE contentCue SET ID = {}, ContentID = {new_content_id_expr}, Cues = NULL, rb_cue_count = 0, updated_at = {now_expr} WHERE ContentID = {};\n",
+                        sql_quote(&content_uuid),
+                        sql_quote(&track.id),
+                    ));
+                } else {
+                    let cues_text = sqlcipher_required_value(
+                        db_path,
+                        key,
+                        &format!(
+                            "SELECT Cues FROM contentCue WHERE ContentID = {} LIMIT 1;",
+                            sql_quote(&track.id)
+                        ),
+                        &format!("missing contentCue JSON for source content {}", track.id),
+                    )?;
+                    let (rewritten_cues, cue_count) = rewrite_content_cues_json(
+                        &cues_text,
+                        &track.id,
+                        &old_uuid,
+                        &migrated_content_id,
+                        &content_uuid,
+                    )?;
+                    sql.push_str(&format!(
+                        "UPDATE contentCue SET ID = {}, ContentID = {new_content_id_expr}, Cues = {}, rb_cue_count = {}, updated_at = {now_expr} WHERE ContentID = {};\n",
+                        sql_quote(&content_uuid),
+                        sql_quote(&rewritten_cues),
+                        cue_count,
+                        sql_quote(&track.id),
+                    ));
+                }
+            }
 
             for file in &migrated_content_files {
                 let new_local_path = file.new_local_path.clone().unwrap_or_default();
