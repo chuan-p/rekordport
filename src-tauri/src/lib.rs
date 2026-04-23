@@ -185,6 +185,20 @@ struct ContentFileRef {
 }
 
 #[derive(Debug)]
+struct TrackMigrationSourceData {
+    old_uuid: String,
+    old_analysis_path: String,
+    content_files: Vec<ContentFileRef>,
+}
+
+#[derive(Debug, Default)]
+struct TrackMigrationSourceDataBuilder {
+    old_uuid: Option<String>,
+    old_analysis_path: Option<String>,
+    content_files: Vec<ContentFileRef>,
+}
+
+#[derive(Debug)]
 struct MigratedContentFile {
     original: ContentFileRef,
     new_id: String,
@@ -1945,6 +1959,141 @@ fn rewrite_analysis_resource_path(
     fallback_analysis_resource_path(value, new_uuid).unwrap_or_else(|| value.to_string())
 }
 
+fn sqlcipher_csv_records(
+    db_path: &Path,
+    key: &str,
+    sql: &str,
+) -> Result<Vec<csv::StringRecord>, String> {
+    let output = run_sqlcipher(db_path, key, sql)?;
+    let filtered = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "ok")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(filtered.as_bytes());
+
+    let mut records = Vec::new();
+    for record in reader.records() {
+        records.push(record.map_err(|error| error.to_string())?);
+    }
+
+    Ok(records)
+}
+
+fn decode_json_string_field(value: Option<&str>) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(text) if text.is_empty() => Ok(None),
+        Some(text) => serde_json::from_str::<String>(text)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn decode_json_string_field_required(value: Option<&str>, error: &str) -> Result<String, String> {
+    decode_json_string_field(value)?.ok_or_else(|| error.to_string())
+}
+
+fn fetch_track_migration_source_data_map(
+    db_path: &Path,
+    key: &str,
+    content_ids: &[&str],
+) -> Result<HashMap<String, TrackMigrationSourceData>, String> {
+    if content_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let content_filter = content_ids
+        .iter()
+        .map(|content_id| sql_quote(content_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        ".headers on\n.mode csv\nSELECT 0 AS sort_key, 'content' AS row_type, json_quote(CAST(ID AS TEXT)) AS source_id, json_quote(COALESCE(UUID, '')) AS c1, json_quote(COALESCE(AnalysisDataPath, '')) AS c2, '' AS c3, '' AS c4, '' AS c5, '' AS c6 FROM djmdContent WHERE ID IN ({content_filter})\nUNION ALL\nSELECT 1 AS sort_key, 'file' AS row_type, json_quote(CAST(ContentID AS TEXT)) AS source_id, json_quote(COALESCE(ID, '')) AS c1, json_quote(COALESCE(Path, '')) AS c2, CASE WHEN rb_local_path IS NULL THEN '' ELSE json_quote(CAST(rb_local_path AS TEXT)) END AS c3, CASE WHEN UUID IS NULL THEN '' ELSE json_quote(CAST(UUID AS TEXT)) END AS c4, CASE WHEN Hash IS NULL THEN '' ELSE json_quote(CAST(Hash AS TEXT)) END AS c5, CASE WHEN Size IS NULL THEN '' ELSE json_quote(CAST(Size AS TEXT)) END AS c6 FROM contentFile WHERE ContentID IN ({content_filter}) ORDER BY sort_key, source_id, c1;"
+    );
+
+    let mut builders: HashMap<String, TrackMigrationSourceDataBuilder> = HashMap::new();
+    for record in sqlcipher_csv_records(db_path, key, &sql)? {
+        let source_id = decode_json_string_field_required(
+            record.get(2),
+            "missing source content id in migration source data",
+        )?;
+        let builder = builders.entry(source_id).or_default();
+        match record.get(1).unwrap_or_default() {
+            "content" => {
+                builder.old_uuid = Some(decode_json_string_field_required(
+                    record.get(3),
+                    "missing UUID for source content",
+                )?);
+                builder.old_analysis_path = Some(decode_json_string_field_required(
+                    record.get(4),
+                    "missing AnalysisDataPath for source content",
+                )?);
+            }
+            "file" => {
+                let id = decode_json_string_field_required(
+                    record.get(3),
+                    "missing contentFile ID for source content",
+                )?;
+                let path = decode_json_string_field_required(
+                    record.get(4),
+                    "missing contentFile Path for source content",
+                )?;
+                let rb_local_path = decode_json_string_field(record.get(5))?;
+                let uuid = decode_json_string_field(record.get(6))?;
+                let hash = decode_json_string_field(record.get(7))?;
+                let size = decode_json_string_field(record.get(8))?
+                    .and_then(|value| value.parse::<u64>().ok());
+                builder.content_files.push(ContentFileRef {
+                    id,
+                    path,
+                    rb_local_path,
+                    uuid,
+                    hash,
+                    size,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let mut data = HashMap::new();
+    for content_id in content_ids {
+        let builder = builders
+            .remove(*content_id)
+            .ok_or_else(|| format!("missing djmdContent row for source content {}", content_id))?;
+        data.insert(
+            (*content_id).to_string(),
+            TrackMigrationSourceData {
+                old_uuid: builder
+                    .old_uuid
+                    .ok_or_else(|| format!("missing UUID for source content {}", content_id))?,
+                old_analysis_path: builder.old_analysis_path.unwrap_or_default(),
+                content_files: builder.content_files,
+            },
+        );
+    }
+
+    Ok(data)
+}
+
+#[allow(dead_code)]
+fn fetch_track_migration_source_data(
+    db_path: &Path,
+    key: &str,
+    content_id: &str,
+) -> Result<TrackMigrationSourceData, String> {
+    fetch_track_migration_source_data_map(db_path, key, &[content_id])?
+        .into_iter()
+        .next()
+        .map(|(_, data)| data)
+        .ok_or_else(|| format!("missing djmdContent row for source content {}", content_id))
+}
+
+#[allow(dead_code)]
 fn fetch_content_files(
     db_path: &Path,
     key: &str,
@@ -2859,15 +3008,15 @@ fn check_database_readable(db_path: &Path, key: &str) -> bool {
     run_sqlcipher(db_path, key, "SELECT COUNT(*) FROM djmdContent LIMIT 1;").is_ok()
 }
 
-fn ensure_database_writable(db_path: &Path, key: &str) -> Result<(), String> {
-    run_sqlcipher(db_path, key, "BEGIN IMMEDIATE;\nROLLBACK;")
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "database is not writable before conversion: {}. Close Rekordbox and any backup/sync tools that may be using master.db, then try again.",
-                error
-            )
-        })
+fn append_rollback_errors(error: String, rollback_errors: Vec<String>) -> String {
+    if rollback_errors.is_empty() {
+        return error;
+    }
+
+    format!(
+        "{error}. Rollback also failed: {}",
+        rollback_errors.join(" | ")
+    )
 }
 
 fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
@@ -2892,6 +3041,20 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     };
 
     let mut warnings = Vec::new();
+    if db_exists {
+        if let Some(backup_parent) = db_path_buf.parent() {
+            match conversion_session::recover_stale_conversion_backups(backup_parent) {
+                Ok(report) => {
+                    warnings.extend(report.warnings);
+                    warnings.extend(report.errors);
+                }
+                Err(error) => warnings.push(format!(
+                    "failed to recover interrupted conversion backups while checking this library: {}",
+                    error
+                )),
+            }
+        }
+    }
     if !sqlcipher_available {
         warnings.push("sqlcipher was not found, so rekordbox master.db cannot be read. Add a bundled sidecar in src-tauri/bin or install it in the system PATH.".to_string());
     }
@@ -3243,7 +3406,7 @@ fn migrate_tracks_in_db(
         );
         sql.push_str("DELETE FROM migration_state;\n");
         sql.push_str("INSERT INTO migration_state (next_id) SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdContent WHERE ID GLOB '[0-9]*';\n");
-        sql.push_str("CREATE TEMP TABLE IF NOT EXISTS migration_results (source_id TEXT NOT NULL, new_id TEXT NOT NULL);\n");
+        sql.push_str("CREATE TEMP TABLE IF NOT EXISTS migration_results (source_id TEXT NOT NULL, new_id TEXT NOT NULL, new_uuid TEXT NOT NULL);\n");
         sql.push_str("DELETE FROM migration_results;\n");
         let mut next_content_id = sqlcipher_required_value(
             db_path,
@@ -3256,6 +3419,8 @@ fn migrate_tracks_in_db(
 
         let new_content_id_expr = "(SELECT CAST(next_id AS TEXT) FROM migration_state LIMIT 1)";
         let mut analysis_summaries: Vec<(String, String)> = Vec::with_capacity(tracks.len());
+        let track_ids: Vec<&str> = tracks.iter().map(|track| track.id.as_str()).collect();
+        let source_data_map = fetch_track_migration_source_data_map(db_path, key, &track_ids)?;
 
         for (track, output_track) in tracks.iter().zip(output_tracks.iter()) {
             let migrated_content_id = next_content_id.to_string();
@@ -3275,25 +3440,12 @@ fn migrate_tracks_in_db(
                 output_path,
                 output_track.sample_rate.unwrap_or(44_100),
             )?;
-            let old_uuid = sqlcipher_required_value(
-                db_path,
-                key,
-                &format!(
-                    "SELECT UUID FROM djmdContent WHERE ID = {} LIMIT 1;",
-                    sql_quote(&track.id)
-                ),
-                &format!("missing UUID for source content {}", track.id),
-            )?;
-            let old_analysis_path = sqlcipher_single_value(
-                db_path,
-                key,
-                &format!(
-                    "SELECT AnalysisDataPath FROM djmdContent WHERE ID = {} LIMIT 1;",
-                    sql_quote(&track.id)
-                ),
-            )?
-            .unwrap_or_default();
-            let content_files = fetch_content_files(db_path, key, &track.id)?;
+            let source_data = source_data_map
+                .get(&track.id)
+                .ok_or_else(|| format!("missing migration source data for track {}", track.id))?;
+            let old_uuid = &source_data.old_uuid;
+            let old_analysis_path = &source_data.old_analysis_path;
+            let content_files = &source_data.content_files;
             let content_uuid = Uuid::new_v4().to_string();
             let select_columns: Vec<String> = insert_columns
                 .iter()
@@ -3308,7 +3460,7 @@ fn migrate_tracks_in_db(
             let mut missing_analysis_resource = false;
             let source_has_analysis = !content_files.is_empty() || !old_analysis_path.is_empty();
 
-            match validate_analysis_resources(&content_files) {
+            match validate_analysis_resources(content_files) {
                 Ok(validated_files) => {
                     for file in validated_files {
                         let source_path =
@@ -3532,7 +3684,6 @@ fn migrate_tracks_in_db(
                     ));
                 }
             }
-
             for file in &migrated_content_files {
                 let new_local_path = file.new_local_path.clone().unwrap_or_default();
                 sql.push_str(&format!(
@@ -3556,7 +3707,7 @@ fn migrate_tracks_in_db(
         ));
             }
 
-            for file in &content_files {
+            for file in content_files {
                 if migrated_content_files
                     .iter()
                     .any(|candidate| candidate.original.id == file.id)
@@ -3575,11 +3726,16 @@ fn migrate_tracks_in_db(
                 sql_quote(&track.id),
             ));
             sql.push_str(&format!(
-        "INSERT INTO migration_results (source_id, new_id) VALUES ({}, {new_content_id_expr});\n",
+        "INSERT INTO migration_results (source_id, new_id, new_uuid) VALUES ({}, {new_content_id_expr}, {});\n",
         sql_quote(&track.id),
+        sql_quote(&content_uuid),
       ));
             sql.push_str("UPDATE migration_state SET next_id = next_id + 1;\n");
         }
+
+        sql.push_str(&format!(
+            "UPDATE contentCue SET\n  ID = (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1),\n  ContentID = (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1),\n  Cues = CASE\n    WHEN Cues IS NULL THEN NULL\n    WHEN json_type(Cues) = 'array' THEN COALESCE((SELECT json_group_array(CASE WHEN json_type(value) = 'object' THEN json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE value END) FROM json_each(contentCue.Cues)), '[]')\n    WHEN json_type(Cues) = 'object' THEN json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1))\n    ELSE Cues\n  END,\n  rb_cue_count = CASE\n    WHEN Cues IS NULL THEN COALESCE(rb_cue_count, 0)\n    WHEN json_type(Cues) = 'array' THEN COALESCE(json_array_length(Cues), 0)\n    ELSE COALESCE(rb_cue_count, 0)\n  END,\n  updated_at = {now_expr}\nWHERE ContentID IN (SELECT source_id FROM migration_results);\n"
+        ));
 
         sql.push_str("SELECT source_id || '|' || new_id FROM migration_results ORDER BY rowid;\n");
         sql.push_str("COMMIT;\n");
@@ -3655,7 +3811,19 @@ where
         );
     }
     let png_encoder_available = ffmpeg_has_encoder("png").unwrap_or(false);
-    ensure_database_writable(&db_path, DEFAULT_KEY)?;
+    let mut warnings = Vec::new();
+    if let Some(backup_parent) = db_path.parent() {
+        match conversion_session::recover_stale_conversion_backups(backup_parent) {
+            Ok(report) => {
+                warnings.extend(report.warnings);
+                warnings.extend(report.errors);
+            }
+            Err(error) => warnings.push(format!(
+                "failed to recover interrupted conversion backups before starting: {}",
+                error
+            )),
+        }
+    }
 
     let timestamp = timestamp_token();
     let backup_root = db_path
@@ -3699,11 +3867,47 @@ where
                 if skipped_embedded_artwork {
                     skipped_embedded_artwork_count += 1;
                 }
+                if let Err(error) = conversion_session::append_manifest_entry(
+                    &backup_root,
+                    &conversion_session::ConversionManifestEntry {
+                        track_id: track.id.clone(),
+                        source_path: track.full_path.clone(),
+                        archive_path: archive_path.to_string_lossy().to_string(),
+                        output_path: output_path.to_string_lossy().to_string(),
+                    },
+                ) {
+                    let mut rollback_errors = Vec::new();
+                    if let Err(rollback_error) = remove_file_path(&output_path) {
+                        rollback_errors.push(format!(
+                            "failed to remove converted output {} after manifest append failed: {}",
+                            output_path.display(),
+                            rollback_error
+                        ));
+                    }
+                    if let Err(rollback_error) =
+                        rename_path(&archive_path, Path::new(&track.full_path))
+                    {
+                        rollback_errors.push(format!(
+                            "failed to restore archived source {} -> {} after manifest append failed: {}",
+                            archive_path.display(),
+                            track.full_path,
+                            rollback_error
+                        ));
+                    }
+                    rollback_errors.extend(session.rollback_all());
+                    if rollback_errors.is_empty() {
+                        let _ = conversion_session::remove_manifest(&backup_root);
+                    }
+                    return Err(append_rollback_errors(error, rollback_errors));
+                }
                 session.push(track, converted_track, output_path, archive_path);
             }
             Err(error) => {
-                session.rollback_all();
-                return Err(error);
+                let rollback_errors = session.rollback_all();
+                if rollback_errors.is_empty() {
+                    let _ = conversion_session::remove_manifest(&backup_root);
+                }
+                return Err(append_rollback_errors(error, rollback_errors));
             }
         }
     }
@@ -3720,12 +3924,14 @@ where
         match migrate_tracks_in_db(&db_path, &req.tracks, &converted_tracks, DEFAULT_KEY, &spec) {
             Ok(tracks) => tracks,
             Err(error) => {
-                session.rollback_all();
-                return Err(error);
+                let rollback_errors = session.rollback_all();
+                if rollback_errors.is_empty() {
+                    let _ = conversion_session::remove_manifest(&backup_root);
+                }
+                return Err(append_rollback_errors(error, rollback_errors));
             }
         };
 
-    let mut warnings = Vec::new();
     if skipped_embedded_artwork_count > 0 {
         warnings.push(
             format!(
@@ -3759,6 +3965,13 @@ where
                 source_cleanup_failures += 1;
             }
         }
+    }
+
+    if let Err(error) = conversion_session::remove_manifest(&backup_root) {
+        warnings.push(format!(
+            "Converted files and database changes were saved, but the interrupted-conversion manifest could not be removed automatically: {}",
+            error
+        ));
     }
 
     let response = ConvertResponse {

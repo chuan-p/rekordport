@@ -1,4 +1,7 @@
 use super::*;
+use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Write;
 
 #[derive(Debug)]
 pub(super) struct ConvertedArtifact {
@@ -11,6 +14,20 @@ pub(super) struct ConvertedArtifact {
 #[derive(Debug, Default)]
 pub(super) struct ConversionSession {
     artifacts: Vec<ConvertedArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ConversionManifestEntry {
+    pub(super) track_id: String,
+    pub(super) source_path: String,
+    pub(super) archive_path: String,
+    pub(super) output_path: String,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ConversionRecoveryReport {
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 impl ConversionSession {
@@ -44,22 +61,212 @@ impl ConversionSession {
         self.artifacts.iter().map(|artifact| &artifact.archive_path)
     }
 
-    pub(super) fn remove_outputs(&self) {
+    pub(super) fn remove_outputs(&self) -> Vec<String> {
+        let mut errors = Vec::new();
         for artifact in &self.artifacts {
-            let _ = remove_file_path(&artifact.output_path);
+            if let Err(error) = remove_file_path(&artifact.output_path) {
+                errors.push(format!(
+                    "failed to remove converted output {}: {}",
+                    artifact.output_path.display(),
+                    error
+                ));
+            }
+        }
+        errors
+    }
+
+    pub(super) fn restore_archives(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for artifact in &self.artifacts {
+            if let Err(error) = rename_path(&artifact.archive_path, &artifact.source_path) {
+                errors.push(format!(
+                    "failed to restore archived source {} -> {}: {}",
+                    artifact.archive_path.display(),
+                    artifact.source_path.display(),
+                    error
+                ));
+            }
+        }
+        errors
+    }
+
+    pub(super) fn rollback_all(&self) -> Vec<String> {
+        let mut errors = self.remove_outputs();
+        errors.extend(self.restore_archives());
+        errors
+    }
+}
+
+fn manifest_path(backup_root: &Path) -> PathBuf {
+    backup_root.join("manifest.jsonl")
+}
+
+pub(super) fn append_manifest_entry(
+    backup_root: &Path,
+    entry: &ConversionManifestEntry,
+) -> Result<(), String> {
+    let manifest = manifest_path(backup_root);
+    if let Some(parent) = manifest.parent() {
+        create_dir_all_path(parent)?;
+    }
+    let line = serde_json::to_string(entry)
+        .map_err(|error| format!("failed to serialize conversion manifest entry: {}", error))?;
+
+    retry_io_operation(
+        format!("failed to append manifest {}", manifest.display()),
+        || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&manifest)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+            Ok(())
+        },
+    )
+}
+
+pub(super) fn remove_manifest(backup_root: &Path) -> Result<(), String> {
+    let manifest = manifest_path(backup_root);
+    if !path_exists(&manifest)? {
+        return Ok(());
+    }
+    remove_file_path(&manifest)
+}
+
+pub(super) fn stale_conversion_backup_manifests(
+    backup_parent: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    if !path_exists(backup_parent)? {
+        return Ok(Vec::new());
+    }
+
+    let mut manifests = Vec::new();
+    for entry in read_dir_path(backup_parent)? {
+        let entry = entry.map_err(|error| {
+            io_error_message(
+                &format!(
+                    "failed to read backup directory entry in {}",
+                    backup_parent.display()
+                ),
+                &error,
+            )
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rkb-lossless-backup-"))
+        {
+            continue;
+        }
+        let manifest = manifest_path(&path);
+        if path_exists(&manifest)? {
+            manifests.push(manifest);
         }
     }
 
-    pub(super) fn restore_archives(&self) {
-        for artifact in &self.artifacts {
-            let _ = rename_path(&artifact.archive_path, &artifact.source_path);
+    Ok(manifests)
+}
+
+fn recover_manifest_entry(entry: &ConversionManifestEntry) -> ConversionRecoveryReport {
+    let mut report = ConversionRecoveryReport::default();
+    let source = PathBuf::from(&entry.source_path);
+    let archive = PathBuf::from(&entry.archive_path);
+    let output = PathBuf::from(&entry.output_path);
+
+    if path_exists(&output).unwrap_or(false) {
+        if let Err(error) = remove_file_path(&output) {
+            report.errors.push(format!(
+                "failed to remove interrupted output {} for track {}: {}",
+                output.display(),
+                entry.track_id,
+                error
+            ));
         }
     }
 
-    pub(super) fn rollback_all(&self) {
-        self.remove_outputs();
-        self.restore_archives();
+    let archive_exists = path_exists(&archive).unwrap_or(false);
+    let source_exists = path_exists(&source).unwrap_or(false);
+
+    if archive_exists {
+        if source_exists {
+            report.warnings.push(format!(
+                "interrupted conversion left both source and archive on disk for track {}: {}",
+                entry.track_id,
+                source.display()
+            ));
+        } else if let Err(error) = rename_path(&archive, &source) {
+            report.errors.push(format!(
+                "failed to restore archived source {} -> {} for track {}: {}",
+                archive.display(),
+                source.display(),
+                entry.track_id,
+                error
+            ));
+        }
+    } else if !source_exists {
+        report.errors.push(format!(
+            "missing both source and archive while recovering interrupted conversion for track {}",
+            entry.track_id
+        ));
     }
+
+    report
+}
+
+pub(super) fn recover_stale_conversion_backups(
+    backup_parent: &Path,
+) -> Result<ConversionRecoveryReport, String> {
+    let mut report = ConversionRecoveryReport::default();
+    for manifest in stale_conversion_backup_manifests(backup_parent)? {
+        let manifest_dir = manifest.parent().unwrap_or(backup_parent);
+        let manifest_text = String::from_utf8_lossy(&read_path(&manifest)?).to_string();
+        let mut had_parse_error = false;
+        let mut manifest_report = ConversionRecoveryReport::default();
+
+        for (line_index, line) in manifest_text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let entry: ConversionManifestEntry = match serde_json::from_str(trimmed) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    manifest_report.errors.push(format!(
+                        "failed to parse conversion manifest {} line {}: {}",
+                        manifest.display(),
+                        line_index + 1,
+                        error
+                    ));
+                    had_parse_error = true;
+                    continue;
+                }
+            };
+            let entry_report = recover_manifest_entry(&entry);
+            manifest_report.warnings.extend(entry_report.warnings);
+            manifest_report.errors.extend(entry_report.errors);
+        }
+
+        if !had_parse_error && manifest_report.errors.is_empty() {
+            if let Err(error) = remove_manifest(manifest_dir) {
+                manifest_report.warnings.push(format!(
+                    "failed to remove recovered manifest {}: {}",
+                    manifest.display(),
+                    error
+                ));
+            }
+        }
+
+        report.warnings.extend(manifest_report.warnings);
+        report.errors.extend(manifest_report.errors);
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -95,14 +302,91 @@ mod tests {
 
         let mut session = ConversionSession::new();
         session.push(&track, track.clone(), output.clone(), archive.clone());
-        session.rollback_all();
+        let errors = session.rollback_all();
 
+        assert!(errors.is_empty());
         assert!(source.exists());
         assert!(!archive.exists());
         assert!(!output.exists());
         assert_eq!(
             fs::read(&source).expect("source should be restored"),
             b"original audio"
+        );
+    }
+
+    #[test]
+    fn rollback_reports_restore_errors() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("track.flac");
+        let output = dir.path().join("track.wav");
+
+        fs::write(&output, b"converted audio").expect("output fixture should be written");
+
+        let track = Track {
+            id: "1".to_string(),
+            source_id: None,
+            scan_issue: None,
+            scan_note: None,
+            analysis_state: None,
+            analysis_note: None,
+            title: "Track".to_string(),
+            artist: "Artist".to_string(),
+            file_type: "FLAC".to_string(),
+            codec_name: None,
+            bit_depth: Some(24),
+            sample_rate: Some(48_000),
+            bitrate: Some(1000),
+            full_path: source.to_string_lossy().to_string(),
+        };
+
+        let mut session = ConversionSession::new();
+        session.push(
+            &track,
+            track.clone(),
+            output.clone(),
+            dir.path().join("missing.flac"),
+        );
+        let errors = session.rollback_all();
+
+        assert!(!errors.is_empty());
+        assert!(!output.exists());
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("failed to restore archived source")));
+    }
+
+    #[test]
+    fn recover_stale_conversion_backups_restores_files_and_clears_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let source = dir.path().join("track.flac");
+        let archive = backup_root.join("music/track-1000kbps.flac");
+        let output = dir.path().join("track.wav");
+
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("backup directories should be created");
+        fs::write(&archive, b"archived audio").expect("archive fixture should be written");
+        fs::write(&output, b"converted audio").expect("output fixture should be written");
+
+        let entry = ConversionManifestEntry {
+            track_id: "1".to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            output_path: output.to_string_lossy().to_string(),
+        };
+        append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
+
+        let report = recover_stale_conversion_backups(dir.path())
+            .expect("stale conversion backup should be recoverable");
+
+        assert!(report.errors.is_empty());
+        assert!(source.exists());
+        assert!(!archive.exists());
+        assert!(!output.exists());
+        assert!(!backup_root.join("manifest.jsonl").exists());
+        assert_eq!(
+            fs::read(&source).expect("source should be restored"),
+            b"archived audio"
         );
     }
 }

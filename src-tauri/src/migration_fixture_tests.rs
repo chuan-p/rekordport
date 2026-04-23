@@ -71,6 +71,14 @@ INSERT INTO djmdContent
   (ID, UUID, MasterSongID, Title, FolderPath, FileNameL, FileNameS, AnalysisDataPath, FileType, BitDepth, BitRate, SampleRate, FileSize, updated_at)
 VALUES
   ('1', 'old-uuid', '1', 'Fixture Track', {}, 'track.flac', 'track.flac', '', 5, 24, 1000, 48000, 6, '');
+INSERT INTO contentCue (ID, ContentID, Cues, rb_cue_count, updated_at)
+VALUES (
+  'cue-1',
+  '1',
+  '[{{"ContentID":"1","ContentUUID":"old-uuid","CueMsec":41234,"Label":"keep me"}}]',
+  1,
+  ''
+);
 INSERT INTO djmdPlaylist (ID, SmartList) VALUES ('10', ''), ('11', 'rules');
 INSERT INTO djmdSongPlaylist (ContentID, PlaylistID, updated_at) VALUES ('1', '10', ''), ('1', '11', '');
 INSERT INTO contentCue (ID, ContentID, Cues, rb_cue_count, updated_at)
