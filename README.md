@@ -120,7 +120,7 @@ See [src-tauri/bin/README.md](src-tauri/bin/README.md) for sidecar naming and pa
 
 ## Windows Build
 
-There is a Windows portable build workflow in [.github/workflows/windows-build.yml](.github/workflows/windows-build.yml).
+There is a Windows build workflow in [.github/workflows/windows-build.yml](.github/workflows/windows-build.yml).
 
 Local Windows build:
 

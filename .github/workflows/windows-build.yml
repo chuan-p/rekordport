@@ -67,7 +67,7 @@ jobs:
         run: |
           $version = node -p "require('./package.json').version"
           $buildDate = Get-Date -Format "yyyy-MM-dd"
-          $releaseName = "rekordport-windows-portable-$version-$buildDate.exe"
+          $releaseName = "rekordport-windows-$version-$buildDate.exe"
           $releaseDir = Join-Path $PWD "release"
           $releasePath = Join-Path $releaseDir $releaseName
 
