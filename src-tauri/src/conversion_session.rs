@@ -216,6 +216,7 @@ fn recover_manifest_entry(entry: &ConversionManifestEntry) -> ConversionRecovery
                 entry.track_id,
                 error
             ));
+            return report;
         }
     }
 
@@ -520,6 +521,35 @@ mod tests {
         assert!(source.exists());
         assert!(!archive.exists());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn recover_stale_conversion_backups_keeps_archive_when_output_removal_fails() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let source = dir.path().join("track.wav");
+        let archive = backup_root.join("music/track-1536kbps.wav");
+
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("backup directories should be created");
+        fs::create_dir_all(&source).expect("source directory should be created");
+        fs::write(&archive, b"archived audio").expect("archive fixture should be written");
+
+        let entry = ConversionManifestEntry {
+            track_id: "1".to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            output_path: source.to_string_lossy().to_string(),
+        };
+        append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
+
+        let report = recover_stale_conversion_backups(dir.path())
+            .expect("stale conversion backup should be recoverable");
+
+        assert!(!report.errors.is_empty());
+        assert!(source.exists());
+        assert!(archive.exists());
+        assert!(backup_root.join("manifest.jsonl").exists());
     }
 
     #[test]

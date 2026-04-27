@@ -61,6 +61,22 @@ jobs:
           "exe_path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "exe_name=$($exe.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
+      - name: Rename portable executable for release
+        id: portable_release
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          $buildDate = Get-Date -Format "yyyy-MM-dd"
+          $releaseName = "rekordport-windows-portable-$version-$buildDate.exe"
+          $releaseDir = Join-Path $PWD "release"
+          $releasePath = Join-Path $releaseDir $releaseName
+
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          Copy-Item "${{ steps.portable.outputs.exe_path }}" $releasePath -Force
+
+          "release_path=$releasePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "release_name=$releaseName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Smoke test portable executable
         shell: pwsh
         run: |
@@ -86,9 +102,9 @@ jobs:
       - name: Upload Windows portable executable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rekordport-windows-portable-exe-${{ github.run_number }}
+          name: ${{ steps.portable_release.outputs.release_name }}
           path: |
-            ${{ steps.portable.outputs.exe_path }}
+            ${{ steps.portable_release.outputs.release_path }}
 
       - name: Add build summary
         shell: pwsh
@@ -96,7 +112,7 @@ jobs:
           @"
           ## Windows portable build ready
 
-          - Portable executable: `${{ steps.portable.outputs.exe_name }}`
+          - Portable executable: `${{ steps.portable_release.outputs.release_name }}`
           - Ref: `${{ github.ref_name }}`
           - Run: `${{ github.run_number }}`
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
@@ -108,11 +124,12 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          $exe = "${{ steps.portable.outputs.exe_path }}"
+          $exe = "${{ steps.portable_release.outputs.release_path }}"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --title $tag --notes "Automated Windows portable executable build."
           }
 
+          gh release delete-asset $tag "rekordport.exe" --yes *> $null
           gh release upload $tag $exe --clobber

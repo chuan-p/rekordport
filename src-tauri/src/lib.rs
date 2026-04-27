@@ -32,6 +32,7 @@ mod process;
 const DEFAULT_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
 const LATEST_RELEASE_URL: &str = "https://github.com/chuan-p/rekordport/releases/latest";
 const HI_RES_SAMPLE_RATE_THRESHOLD: u32 = 48_000;
+#[cfg(test)]
 const WAV_FORMAT_TAG_PCM: u16 = 0x0001;
 const WAV_FORMAT_TAG_EXTENSIBLE: u16 = 0xFFFE;
 #[cfg(target_os = "windows")]
@@ -298,6 +299,7 @@ static COMMAND_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static COMMAND_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
 static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static AUDIO_PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, AudioProbeCacheEntry>>> = OnceLock::new();
+static CONVERSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn refresh_command_discovery_caches() {
     if let Some(cache) = COMMAND_CACHE.get() {
@@ -659,26 +661,6 @@ fn candidate_search_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn is_windows_unc_path(path: &Path) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        matches!(
-            path.components().next(),
-            Some(Component::Prefix(prefix))
-                if matches!(
-                    prefix.kind(),
-                    std::path::Prefix::UNC(_, _) | std::path::Prefix::VerbatimUNC(_, _)
-                )
-        )
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = path;
-        false
-    }
-}
-
 fn is_windows_lock_error(error: &io::Error) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -767,7 +749,7 @@ fn duplicate_path_best_effort(source: &Path, destination: &Path) -> Result<(), S
                 fs::create_dir_all(parent)?;
             }
 
-            if fs::hard_link(source, destination).is_ok() {
+            if clone_file_on_macos(source, destination).unwrap_or(false) {
                 return Ok(());
             }
 
@@ -922,7 +904,6 @@ fn preview_requires_transcode(source: &Path) -> bool {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn ensure_preview_cached_copy(source: &Path) -> Result<PathBuf, String> {
     let cached = preview_cache_path_for(source)?;
     if path_exists(&cached)? {
@@ -1058,28 +1039,7 @@ fn prepare_preview_path_impl(path: String) -> Result<String, String> {
         return Ok(preview_path_string(&transcoded));
     }
 
-    if !is_windows_unc_path(&source) {
-        return Ok(preview_path_string(&source));
-    }
-
-    let cached = preview_cache_path_for(&source)?;
-    let source_meta = metadata_path(&source)?;
-    let needs_refresh = match metadata_path(&cached) {
-        Ok(meta) => meta.len() != source_meta.len(),
-        Err(_) => true,
-    };
-
-    if needs_refresh {
-        copy_path(&source, &cached).map_err(|e| {
-            format!(
-                "failed to cache network preview file locally ({} -> {}): {}",
-                source.display(),
-                cached.display(),
-                e
-            )
-        })?;
-    }
-
+    let cached = ensure_preview_cached_copy(&source)?;
     Ok(preview_path_string(&cached))
 }
 
@@ -1562,7 +1522,7 @@ fn run_sqlcipher(db_path: &Path, key: &str, sql: &str) -> Result<String, String>
         return Err("sqlcipher command not found in PATH or bundled sidecar".into());
     }
 
-    let script = format!("PRAGMA key = '{key}';\nPRAGMA foreign_keys = ON;\n{sql}\n");
+    let script = format!(".bail on\nPRAGMA key = '{key}';\nPRAGMA foreign_keys = ON;\n{sql}\n");
 
     let mut sqlcipher = prepared_command("sqlcipher")?;
     let output = sqlcipher
@@ -1870,16 +1830,15 @@ where
         if row.file_type == 11 && !hi_res_pcm && !row.full_path.trim().is_empty() {
             let source = Path::new(&row.full_path);
             if path_exists(source).unwrap_or(false) {
-                match probe_wav_format_tag(source).unwrap_or(None) {
-                    Some(WAV_FORMAT_TAG_EXTENSIBLE) => {
-                        include_track = true;
-                        stats.wav_extensible += 1;
-                        scan_issue = Some("wav_extensible".to_string());
-                        scan_note = Some(
-                            "WAV header uses WAVE_FORMAT_EXTENSIBLE. Some CDJ/XDJ players reject these files even when the bit depth and sample rate look compatible.".to_string(),
-                        );
-                    }
-                    Some(WAV_FORMAT_TAG_PCM) | None | Some(_) => {}
+                if let Some(WAV_FORMAT_TAG_EXTENSIBLE) =
+                    probe_wav_format_tag(source).unwrap_or(None)
+                {
+                    include_track = true;
+                    stats.wav_extensible += 1;
+                    scan_issue = Some("wav_extensible".to_string());
+                    scan_note = Some(
+                        "WAV header uses WAVE_FORMAT_EXTENSIBLE. Some CDJ/XDJ players reject these files even when the bit depth and sample rate look compatible.".to_string(),
+                    );
                 }
             }
         }
@@ -2071,7 +2030,7 @@ fn sqlcipher_csv_records(
 fn decode_json_string_field(value: Option<&str>) -> Result<Option<String>, String> {
     match value {
         None => Ok(None),
-        Some(text) if text.is_empty() => Ok(None),
+        Some("") => Ok(None),
         Some(text) => serde_json::from_str::<String>(text)
             .map(Some)
             .map_err(|error| error.to_string()),
@@ -2086,6 +2045,7 @@ fn fetch_track_migration_source_data_map(
     db_path: &Path,
     key: &str,
     content_ids: &[&str],
+    schema_columns: &HashMap<String, Vec<String>>,
 ) -> Result<HashMap<String, TrackMigrationSourceData>, String> {
     if content_ids.is_empty() {
         return Ok(HashMap::new());
@@ -2096,8 +2056,54 @@ fn fetch_track_migration_source_data_map(
         .map(|content_id| sql_quote(content_id))
         .collect::<Vec<_>>()
         .join(", ");
+    let content_uuid_expr = if schema_has_column(schema_columns, "djmdContent", "UUID") {
+        "json_quote(COALESCE(UUID, ''))"
+    } else {
+        "json_quote('')"
+    };
+    let content_analysis_expr =
+        if schema_has_column(schema_columns, "djmdContent", "AnalysisDataPath") {
+            "json_quote(COALESCE(AnalysisDataPath, ''))"
+        } else {
+            "json_quote('')"
+        };
+    let content_select = format!(
+        "SELECT 0 AS sort_key, 'content' AS row_type, json_quote(CAST(ID AS TEXT)) AS source_id, {content_uuid_expr} AS c1, {content_analysis_expr} AS c2, '' AS c3, '' AS c4, '' AS c5, '' AS c6 FROM djmdContent WHERE ID IN ({content_filter})"
+    );
+    let mut selects = vec![content_select];
+
+    if schema_has_column(schema_columns, "contentFile", "ContentID")
+        && schema_has_column(schema_columns, "contentFile", "ID")
+        && schema_has_column(schema_columns, "contentFile", "Path")
+    {
+        let rb_local_expr = if schema_has_column(schema_columns, "contentFile", "rb_local_path") {
+            "CASE WHEN rb_local_path IS NULL THEN '' ELSE json_quote(CAST(rb_local_path AS TEXT)) END"
+        } else {
+            "''"
+        };
+        let file_uuid_expr = if schema_has_column(schema_columns, "contentFile", "UUID") {
+            "CASE WHEN UUID IS NULL THEN '' ELSE json_quote(CAST(UUID AS TEXT)) END"
+        } else {
+            "''"
+        };
+        let hash_expr = if schema_has_column(schema_columns, "contentFile", "Hash") {
+            "CASE WHEN Hash IS NULL THEN '' ELSE json_quote(CAST(Hash AS TEXT)) END"
+        } else {
+            "''"
+        };
+        let size_expr = if schema_has_column(schema_columns, "contentFile", "Size") {
+            "CASE WHEN Size IS NULL THEN '' ELSE json_quote(CAST(Size AS TEXT)) END"
+        } else {
+            "''"
+        };
+        selects.push(format!(
+            "SELECT 1 AS sort_key, 'file' AS row_type, json_quote(CAST(ContentID AS TEXT)) AS source_id, json_quote(CAST(ID AS TEXT)) AS c1, json_quote(COALESCE(Path, '')) AS c2, {rb_local_expr} AS c3, {file_uuid_expr} AS c4, {hash_expr} AS c5, {size_expr} AS c6 FROM contentFile WHERE ContentID IN ({content_filter})"
+        ));
+    }
+
     let sql = format!(
-        ".headers on\n.mode csv\nSELECT 0 AS sort_key, 'content' AS row_type, json_quote(CAST(ID AS TEXT)) AS source_id, json_quote(COALESCE(UUID, '')) AS c1, json_quote(COALESCE(AnalysisDataPath, '')) AS c2, '' AS c3, '' AS c4, '' AS c5, '' AS c6 FROM djmdContent WHERE ID IN ({content_filter})\nUNION ALL\nSELECT 1 AS sort_key, 'file' AS row_type, json_quote(CAST(ContentID AS TEXT)) AS source_id, json_quote(COALESCE(ID, '')) AS c1, json_quote(COALESCE(Path, '')) AS c2, CASE WHEN rb_local_path IS NULL THEN '' ELSE json_quote(CAST(rb_local_path AS TEXT)) END AS c3, CASE WHEN UUID IS NULL THEN '' ELSE json_quote(CAST(UUID AS TEXT)) END AS c4, CASE WHEN Hash IS NULL THEN '' ELSE json_quote(CAST(Hash AS TEXT)) END AS c5, CASE WHEN Size IS NULL THEN '' ELSE json_quote(CAST(Size AS TEXT)) END AS c6 FROM contentFile WHERE ContentID IN ({content_filter}) ORDER BY sort_key, source_id, c1;"
+        ".headers on\n.mode csv\n{} ORDER BY sort_key, source_id, c1;",
+        selects.join("\nUNION ALL\n")
     );
 
     let mut builders: HashMap<String, TrackMigrationSourceDataBuilder> = HashMap::new();
@@ -2171,7 +2177,8 @@ fn fetch_track_migration_source_data(
     key: &str,
     content_id: &str,
 ) -> Result<TrackMigrationSourceData, String> {
-    fetch_track_migration_source_data_map(db_path, key, &[content_id])?
+    let schema_columns = table_columns_map(db_path, key, &["djmdContent", "contentFile"])?;
+    fetch_track_migration_source_data_map(db_path, key, &[content_id], &schema_columns)?
         .into_iter()
         .next()
         .map(|(_, data)| data)
@@ -2517,6 +2524,47 @@ fn has_column(columns: &[String], column: &str) -> bool {
     columns.iter().any(|candidate| candidate == column)
 }
 
+fn schema_has_table(schema: &HashMap<String, Vec<String>>, table: &str) -> bool {
+    schema.contains_key(table)
+}
+
+fn schema_has_column(schema: &HashMap<String, Vec<String>>, table: &str, column: &str) -> bool {
+    schema
+        .get(table)
+        .is_some_and(|columns| has_column(columns, column))
+}
+
+fn updated_at_assignment(
+    schema: &HashMap<String, Vec<String>>,
+    table: &str,
+    now_expr: &str,
+) -> Option<String> {
+    schema_has_column(schema, table, "updated_at").then(|| format!("updated_at = {now_expr}"))
+}
+
+fn update_content_id_sql(
+    schema: &HashMap<String, Vec<String>>,
+    table: &str,
+    new_content_id_expr: &str,
+    old_content_id: &str,
+    now_expr: &str,
+) -> Option<String> {
+    if !schema_has_column(schema, table, "ContentID") {
+        return None;
+    }
+
+    let mut assignments = vec![format!("ContentID = {new_content_id_expr}")];
+    if let Some(updated_at) = updated_at_assignment(schema, table, now_expr) {
+        assignments.push(updated_at);
+    }
+
+    Some(format!(
+        "UPDATE {table} SET {} WHERE ContentID = {};\n",
+        assignments.join(", "),
+        sql_quote(old_content_id),
+    ))
+}
+
 fn djmd_cue_migration_sql(
     columns: &[String],
     new_content_id_expr: &str,
@@ -2525,10 +2573,14 @@ fn djmd_cue_migration_sql(
     offset_ms: u32,
     now_expr: &str,
 ) -> String {
-    let mut assignments = vec![
-        format!("ContentID = {new_content_id_expr}"),
-        format!("ContentUUID = {}", sql_quote(content_uuid)),
-    ];
+    if !has_column(columns, "ContentID") {
+        return String::new();
+    }
+
+    let mut assignments = vec![format!("ContentID = {new_content_id_expr}")];
+    if has_column(columns, "ContentUUID") {
+        assignments.push(format!("ContentUUID = {}", sql_quote(content_uuid)));
+    }
 
     if offset_ms > 0 {
         let offset_frames = ((u64::from(offset_ms) * 150) + 500) / 1000;
@@ -2560,7 +2612,9 @@ fn djmd_cue_migration_sql(
         }
     }
 
-    assignments.push(format!("updated_at = {now_expr}"));
+    if has_column(columns, "updated_at") {
+        assignments.push(format!("updated_at = {now_expr}"));
+    }
 
     format!(
         "UPDATE djmdCue SET {} WHERE ContentID = {};\n",
@@ -3301,7 +3355,8 @@ fn build_source_archive_path(
 fn convert_one_track(
     track: &Track,
     spec: &ConversionSpec,
-    backup_root: &Path,
+    manifest_root: &Path,
+    source_backup_root: &Path,
     archive_conflict_resolution: ConflictResolution,
     output_conflict_resolution: ConflictResolution,
     png_encoder_available: bool,
@@ -3319,9 +3374,9 @@ fn convert_one_track(
         build_source_archive_path(source, source_bitrate, archive_conflict_resolution)?;
     let mut output_path = build_target_path(source, spec, output_conflict_resolution)?;
 
-    backup_file_tree(source, backup_root)?;
+    backup_file_tree(source, source_backup_root)?;
     conversion_session::append_manifest_entry(
-        backup_root,
+        manifest_root,
         &conversion_session::ConversionManifestEntry {
             track_id: track.id.clone(),
             source_path: track.full_path.clone(),
@@ -3519,7 +3574,28 @@ fn migrate_tracks_in_db(
     key: &str,
     spec: &ConversionSpec,
 ) -> Result<Vec<Track>, String> {
-    let schema_columns = table_columns_map(db_path, key, &["djmdContent", "djmdCue"])?;
+    let schema_columns = table_columns_map(
+        db_path,
+        key,
+        &[
+            "djmdContent",
+            "djmdCue",
+            "contentActiveCensor",
+            "djmdActiveCensor",
+            "djmdMixerParam",
+            "djmdPlaylist",
+            "djmdSongPlaylist",
+            "djmdSongMyTag",
+            "djmdSongTagList",
+            "djmdSongHotCueBanklist",
+            "djmdSongHistory",
+            "djmdSongRelatedTracks",
+            "djmdSongSampler",
+            "djmdRecommendLike",
+            "contentFile",
+            "contentCue",
+        ],
+    )?;
     let content_columns = schema_columns
         .get("djmdContent")
         .cloned()
@@ -3541,7 +3617,8 @@ fn migrate_tracks_in_db(
         let new_content_id_expr = "(SELECT CAST(next_id AS TEXT) FROM migration_state LIMIT 1)";
         let mut analysis_summaries: Vec<(String, String)> = Vec::with_capacity(tracks.len());
         let track_ids: Vec<&str> = tracks.iter().map(|track| track.id.as_str()).collect();
-        let source_data_map = fetch_track_migration_source_data_map(db_path, key, &track_ids)?;
+        let source_data_map =
+            fetch_track_migration_source_data_map(db_path, key, &track_ids, &schema_columns)?;
 
         for (track, output_track) in tracks.iter().zip(output_tracks.iter()) {
             let output_path = Path::new(&output_track.full_path);
@@ -3586,7 +3663,7 @@ fn migrate_tracks_in_db(
                             })?;
                         let destination_path = rewrite_analysis_resource_path(
                             source_path,
-                            &old_uuid,
+                            old_uuid,
                             file.original.uuid.as_deref(),
                             &content_uuid,
                         );
@@ -3599,20 +3676,20 @@ fn migrate_tracks_in_db(
                         let hash = md5_hex(&destination)?;
                         let new_id = rewrite_analysis_resource_value(
                             &file.original.id,
-                            &old_uuid,
+                            old_uuid,
                             file.original.uuid.as_deref(),
                             &content_uuid,
                         );
                         let new_path = rewrite_analysis_resource_path(
                             &file.original.path,
-                            &old_uuid,
+                            old_uuid,
                             file.original.uuid.as_deref(),
                             &content_uuid,
                         );
                         let new_local_path = file.original.rb_local_path.as_ref().map(|path| {
                             rewrite_analysis_resource_path(
                                 path,
-                                &old_uuid,
+                                old_uuid,
                                 file.original.uuid.as_deref(),
                                 &content_uuid,
                             )
@@ -3668,7 +3745,7 @@ fn migrate_tracks_in_db(
             let new_analysis_path = if old_analysis_path.is_empty() || missing_analysis_resource {
                 old_analysis_path.clone()
             } else {
-                rewrite_analysis_resource_path(&old_analysis_path, &old_uuid, None, &content_uuid)
+                rewrite_analysis_resource_path(old_analysis_path, old_uuid, None, &content_uuid)
             };
             let new_analysis_path = if missing_analysis_resource {
                 String::new()
@@ -3676,103 +3753,229 @@ fn migrate_tracks_in_db(
                 new_analysis_path
             };
 
-            sql.push_str(&format!(
-        "UPDATE djmdContent SET FolderPath = {}, FileNameL = {}, FileNameS = {}, AnalysisDataPath = {}, FileType = {}, BitDepth = {}, BitRate = {}, SampleRate = {}, FileSize = {}, updated_at = {now_expr} WHERE ID = {new_content_id_expr};\n",
-        sql_quote(&folder_path),
-        sql_quote(&file_name),
-        sql_quote(&file_name),
-        sql_quote(&new_analysis_path),
-        spec.file_type,
-        spec.bit_depth,
-        output_track.bitrate.unwrap_or(0),
-        output_track.sample_rate.unwrap_or(44_100),
-        file_size,
-      ));
-
-            sql.push_str(&djmd_cue_migration_sql(
-                &djmd_cue_columns,
-                new_content_id_expr,
-                &content_uuid,
-                &track.id,
-                encoder_priming_offset_ms,
-                now_expr,
-            ));
-            sql.push_str(&format!(
-        "UPDATE contentActiveCensor SET ID = REPLACE(ID, {}, {}), ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&old_uuid),
-        sql_quote(&content_uuid),
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdActiveCensor SET ID = REPLACE(ID, {}, {}), ContentID = {new_content_id_expr}, ContentUUID = {}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&old_uuid),
-        sql_quote(&content_uuid),
-        sql_quote(&content_uuid),
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdMixerParam SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdSongPlaylist SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {} AND PlaylistID IN (SELECT ID FROM djmdPlaylist WHERE COALESCE(SmartList, '') = '');\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdSongMyTag SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdSongTagList SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdSongHotCueBanklist SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdSongHistory SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdSongRelatedTracks SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdSongSampler SET ContentID = {new_content_id_expr}, updated_at = {now_expr} WHERE ContentID = {};\n",
-        sql_quote(&track.id),
-      ));
-            sql.push_str(&format!(
-        "UPDATE djmdRecommendLike SET ContentID1 = CASE WHEN ContentID1 = {} THEN {new_content_id_expr} ELSE ContentID1 END, ContentID2 = CASE WHEN ContentID2 = {} THEN {new_content_id_expr} ELSE ContentID2 END, updated_at = {now_expr} WHERE ContentID1 = {} OR ContentID2 = {};\n",
-        sql_quote(&track.id),
-        sql_quote(&track.id),
-        sql_quote(&track.id),
-        sql_quote(&track.id),
-      ));
-            for file in &migrated_content_files {
-                let new_local_path = file.new_local_path.clone().unwrap_or_default();
+            let mut content_assignments = Vec::new();
+            if has_column(&insert_columns, "FolderPath") {
+                content_assignments.push(format!("FolderPath = {}", sql_quote(&folder_path)));
+            }
+            if has_column(&insert_columns, "FileNameL") {
+                content_assignments.push(format!("FileNameL = {}", sql_quote(&file_name)));
+            }
+            if has_column(&insert_columns, "FileNameS") {
+                content_assignments.push(format!("FileNameS = {}", sql_quote(&file_name)));
+            }
+            if has_column(&insert_columns, "AnalysisDataPath") {
+                content_assignments.push(format!(
+                    "AnalysisDataPath = {}",
+                    sql_quote(&new_analysis_path)
+                ));
+            }
+            if has_column(&insert_columns, "FileType") {
+                content_assignments.push(format!("FileType = {}", spec.file_type));
+            }
+            if has_column(&insert_columns, "BitDepth") {
+                content_assignments.push(format!("BitDepth = {}", spec.bit_depth));
+            }
+            if has_column(&insert_columns, "BitRate") {
+                content_assignments
+                    .push(format!("BitRate = {}", output_track.bitrate.unwrap_or(0)));
+            }
+            if has_column(&insert_columns, "SampleRate") {
+                content_assignments.push(format!(
+                    "SampleRate = {}",
+                    output_track.sample_rate.unwrap_or(44_100)
+                ));
+            }
+            if has_column(&insert_columns, "FileSize") {
+                content_assignments.push(format!("FileSize = {}", file_size));
+            }
+            if has_column(&insert_columns, "updated_at") {
+                content_assignments.push(format!("updated_at = {now_expr}"));
+            }
+            if !content_assignments.is_empty() {
                 sql.push_str(&format!(
-          "UPDATE contentFile SET ID = {}, ContentID = {new_content_id_expr}, UUID = {}, Path = {}, rb_local_path = {}, Hash = {}, Size = {}, updated_at = {now_expr} WHERE ID = {} AND ContentID = {};\n",
-          sql_quote(&file.new_id),
-          file
-            .new_uuid
-            .as_ref()
-            .map(|uuid| sql_quote(uuid))
-            .unwrap_or_else(|| "UUID".to_string()),
-          sql_quote(&file.new_path),
-          if new_local_path.is_empty() {
-            "NULL".to_string()
-          } else {
-            sql_quote(&new_local_path)
-          },
-          sql_quote(&file.hash),
-          file.size,
-          sql_quote(&file.original.id),
-          sql_quote(&track.id),
-        ));
+                    "UPDATE djmdContent SET {} WHERE ID = {new_content_id_expr};\n",
+                    content_assignments.join(", "),
+                ));
+            }
+
+            if schema_has_table(&schema_columns, "djmdCue") {
+                sql.push_str(&djmd_cue_migration_sql(
+                    &djmd_cue_columns,
+                    new_content_id_expr,
+                    &content_uuid,
+                    &track.id,
+                    encoder_priming_offset_ms,
+                    now_expr,
+                ));
+            }
+            if schema_has_column(&schema_columns, "contentActiveCensor", "ContentID") {
+                let mut assignments = Vec::new();
+                if schema_has_column(&schema_columns, "contentActiveCensor", "ID") {
+                    assignments.push(format!(
+                        "ID = REPLACE(ID, {}, {})",
+                        sql_quote(old_uuid),
+                        sql_quote(&content_uuid)
+                    ));
+                }
+                assignments.push(format!("ContentID = {new_content_id_expr}"));
+                if let Some(updated_at) =
+                    updated_at_assignment(&schema_columns, "contentActiveCensor", now_expr)
+                {
+                    assignments.push(updated_at);
+                }
+                sql.push_str(&format!(
+                    "UPDATE contentActiveCensor SET {} WHERE ContentID = {};\n",
+                    assignments.join(", "),
+                    sql_quote(&track.id),
+                ));
+            }
+            if schema_has_column(&schema_columns, "djmdActiveCensor", "ContentID") {
+                let mut assignments = vec![format!("ContentID = {new_content_id_expr}")];
+                if schema_has_column(&schema_columns, "djmdActiveCensor", "ID") {
+                    assignments.push(format!(
+                        "ID = REPLACE(ID, {}, {})",
+                        sql_quote(old_uuid),
+                        sql_quote(&content_uuid)
+                    ));
+                }
+                if schema_has_column(&schema_columns, "djmdActiveCensor", "ContentUUID") {
+                    assignments.push(format!("ContentUUID = {}", sql_quote(&content_uuid)));
+                }
+                if let Some(updated_at) =
+                    updated_at_assignment(&schema_columns, "djmdActiveCensor", now_expr)
+                {
+                    assignments.push(updated_at);
+                }
+                sql.push_str(&format!(
+                    "UPDATE djmdActiveCensor SET {} WHERE ContentID = {};\n",
+                    assignments.join(", "),
+                    sql_quote(&track.id),
+                ));
+            }
+            for table in [
+                "djmdMixerParam",
+                "djmdSongMyTag",
+                "djmdSongTagList",
+                "djmdSongHotCueBanklist",
+                "djmdSongHistory",
+                "djmdSongRelatedTracks",
+                "djmdSongSampler",
+            ] {
+                if let Some(statement) = update_content_id_sql(
+                    &schema_columns,
+                    table,
+                    new_content_id_expr,
+                    &track.id,
+                    now_expr,
+                ) {
+                    sql.push_str(&statement);
+                }
+            }
+            if schema_has_column(&schema_columns, "djmdSongPlaylist", "ContentID")
+                && schema_has_column(&schema_columns, "djmdSongPlaylist", "PlaylistID")
+                && schema_has_column(&schema_columns, "djmdPlaylist", "ID")
+            {
+                let mut assignments = vec![format!("ContentID = {new_content_id_expr}")];
+                if let Some(updated_at) =
+                    updated_at_assignment(&schema_columns, "djmdSongPlaylist", now_expr)
+                {
+                    assignments.push(updated_at);
+                }
+                let smart_list_filter =
+                    if schema_has_column(&schema_columns, "djmdPlaylist", "SmartList") {
+                        "COALESCE(SmartList, '') = ''"
+                    } else {
+                        "1 = 1"
+                    };
+                sql.push_str(&format!(
+                    "UPDATE djmdSongPlaylist SET {} WHERE ContentID = {} AND PlaylistID IN (SELECT ID FROM djmdPlaylist WHERE {smart_list_filter});\n",
+                    assignments.join(", "),
+                    sql_quote(&track.id),
+                ));
+            }
+            if schema_has_column(&schema_columns, "djmdRecommendLike", "ContentID1")
+                && schema_has_column(&schema_columns, "djmdRecommendLike", "ContentID2")
+            {
+                let mut assignments = vec![
+                    format!(
+                        "ContentID1 = CASE WHEN ContentID1 = {} THEN {new_content_id_expr} ELSE ContentID1 END",
+                        sql_quote(&track.id)
+                    ),
+                    format!(
+                        "ContentID2 = CASE WHEN ContentID2 = {} THEN {new_content_id_expr} ELSE ContentID2 END",
+                        sql_quote(&track.id)
+                    ),
+                ];
+                if let Some(updated_at) =
+                    updated_at_assignment(&schema_columns, "djmdRecommendLike", now_expr)
+                {
+                    assignments.push(updated_at);
+                }
+                sql.push_str(&format!(
+                    "UPDATE djmdRecommendLike SET {} WHERE ContentID1 = {} OR ContentID2 = {};\n",
+                    assignments.join(", "),
+                    sql_quote(&track.id),
+                    sql_quote(&track.id),
+                ));
+            }
+            for file in &migrated_content_files {
+                if !schema_has_column(&schema_columns, "contentFile", "ID")
+                    || !schema_has_column(&schema_columns, "contentFile", "ContentID")
+                {
+                    continue;
+                }
+                let new_local_path = file.new_local_path.clone().unwrap_or_default();
+                let mut assignments = vec![
+                    format!("ID = {}", sql_quote(&file.new_id)),
+                    format!("ContentID = {new_content_id_expr}"),
+                ];
+                if schema_has_column(&schema_columns, "contentFile", "UUID") {
+                    assignments.push(format!(
+                        "UUID = {}",
+                        file.new_uuid
+                            .as_ref()
+                            .map(|uuid| sql_quote(uuid))
+                            .unwrap_or_else(|| "UUID".to_string())
+                    ));
+                }
+                if schema_has_column(&schema_columns, "contentFile", "Path") {
+                    assignments.push(format!("Path = {}", sql_quote(&file.new_path)));
+                }
+                if schema_has_column(&schema_columns, "contentFile", "rb_local_path") {
+                    assignments.push(format!(
+                        "rb_local_path = {}",
+                        if new_local_path.is_empty() {
+                            "NULL".to_string()
+                        } else {
+                            sql_quote(&new_local_path)
+                        }
+                    ));
+                }
+                if schema_has_column(&schema_columns, "contentFile", "Hash") {
+                    assignments.push(format!("Hash = {}", sql_quote(&file.hash)));
+                }
+                if schema_has_column(&schema_columns, "contentFile", "Size") {
+                    assignments.push(format!("Size = {}", file.size));
+                }
+                if let Some(updated_at) =
+                    updated_at_assignment(&schema_columns, "contentFile", now_expr)
+                {
+                    assignments.push(updated_at);
+                }
+                sql.push_str(&format!(
+                    "UPDATE contentFile SET {} WHERE ID = {} AND ContentID = {};\n",
+                    assignments.join(", "),
+                    sql_quote(&file.original.id),
+                    sql_quote(&track.id),
+                ));
             }
 
             for file in content_files {
+                if !schema_has_column(&schema_columns, "contentFile", "ID")
+                    || !schema_has_column(&schema_columns, "contentFile", "ContentID")
+                {
+                    continue;
+                }
                 if migrated_content_files
                     .iter()
                     .any(|candidate| candidate.original.id == file.id)
@@ -3798,9 +4001,48 @@ fn migrate_tracks_in_db(
             sql.push_str("UPDATE migration_state SET next_id = next_id + 1;\n");
         }
 
-        sql.push_str(&format!(
-            "UPDATE contentCue SET\n  ID = (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1),\n  ContentID = (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1),\n  Cues = CASE\n    WHEN Cues IS NULL THEN NULL\n    WHEN json_type(Cues) = 'array' THEN COALESCE((SELECT json_group_array(CASE WHEN json_type(value) = 'object' THEN json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE value END) FROM json_each(contentCue.Cues)), '[]')\n    WHEN json_type(Cues) = 'object' THEN json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1))\n    ELSE Cues\n  END,\n  rb_cue_count = CASE\n    WHEN Cues IS NULL THEN COALESCE(rb_cue_count, 0)\n    WHEN json_type(Cues) = 'array' THEN COALESCE(json_array_length(Cues), 0)\n    ELSE COALESCE(rb_cue_count, 0)\n  END,\n  updated_at = {now_expr}\nWHERE ContentID IN (SELECT source_id FROM migration_results);\n"
-        ));
+        if schema_has_column(&schema_columns, "contentCue", "ContentID") {
+            let mut assignments = Vec::new();
+            if schema_has_column(&schema_columns, "contentCue", "ID") {
+                assignments.push(
+                    "ID = (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)"
+                        .to_string(),
+                );
+            }
+            assignments.push(
+                "ContentID = (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)"
+                    .to_string(),
+            );
+            if schema_has_column(&schema_columns, "contentCue", "Cues") {
+                assignments.push(
+                    "Cues = CASE
+    WHEN Cues IS NULL THEN NULL
+    WHEN json_type(Cues) = 'array' THEN COALESCE((SELECT json_group_array(CASE WHEN json_type(value) = 'object' THEN json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE value END) FROM json_each(contentCue.Cues)), '[]')
+    WHEN json_type(Cues) = 'object' THEN json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1))
+    ELSE Cues
+  END"
+                    .to_string(),
+                );
+                if schema_has_column(&schema_columns, "contentCue", "rb_cue_count") {
+                    assignments.push(
+                        "rb_cue_count = CASE
+    WHEN Cues IS NULL THEN COALESCE(rb_cue_count, 0)
+    WHEN json_type(Cues) = 'array' THEN COALESCE(json_array_length(Cues), 0)
+    ELSE COALESCE(rb_cue_count, 0)
+  END"
+                        .to_string(),
+                    );
+                }
+            }
+            if let Some(updated_at) = updated_at_assignment(&schema_columns, "contentCue", now_expr)
+            {
+                assignments.push(updated_at);
+            }
+            sql.push_str(&format!(
+                "UPDATE contentCue SET\n  {}\nWHERE ContentID IN (SELECT source_id FROM migration_results);\n",
+                assignments.join(",\n  "),
+            ));
+        }
 
         sql.push_str("SELECT source_id || '|' || new_id FROM migration_results ORDER BY rowid;\n");
         sql.push_str("COMMIT;\n");
@@ -3930,6 +4172,7 @@ where
         match convert_one_track(
             track,
             &spec,
+            &backup_root,
             &music_backup_root,
             archive_conflict_resolution,
             output_conflict_resolution,
@@ -4297,7 +4540,10 @@ fn open_external_url(url: String) -> Result<(), String> {
 
 fn latest_release_impl() -> Result<LatestReleaseResponse, String> {
     let response = ureq::get(LATEST_RELEASE_URL)
-        .set("User-Agent", concat!("rekordport/", env!("CARGO_PKG_VERSION")))
+        .set(
+            "User-Agent",
+            concat!("rekordport/", env!("CARGO_PKG_VERSION")),
+        )
         .call()
         .map_err(|error| format!("failed to check GitHub releases: {error}"))?;
 
@@ -4317,9 +4563,13 @@ fn latest_release_impl() -> Result<LatestReleaseResponse, String> {
 }
 
 fn fetch_release_changelog(tag_name: &str) -> Option<String> {
-    let url = format!("https://raw.githubusercontent.com/chuan-p/rekordport/{tag_name}/CHANGELOG.md");
+    let url =
+        format!("https://raw.githubusercontent.com/chuan-p/rekordport/{tag_name}/CHANGELOG.md");
     ureq::get(&url)
-        .set("User-Agent", concat!("rekordport/", env!("CARGO_PKG_VERSION")))
+        .set(
+            "User-Agent",
+            concat!("rekordport/", env!("CARGO_PKG_VERSION")),
+        )
         .call()
         .ok()?
         .into_string()
@@ -4358,6 +4608,11 @@ async fn convert_tracks(
     req: ConvertRequest,
 ) -> Result<ConvertResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let conversion_lock = CONVERSION_LOCK.get_or_init(|| Mutex::new(()));
+        let _conversion_guard = conversion_lock
+            .try_lock()
+            .map_err(|_| "another conversion is already running".to_string())?;
+
         let result = convert_impl_with_progress(req, |payload| {
             let _ = app.emit("convert-progress", payload);
         });
@@ -4770,6 +5025,12 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
         );
         assert!(backup.exists());
         assert!(backup.starts_with(&backup_root));
+
+        fs::write(&backup, b"mutated backup").expect("backup should be writable");
+        assert_eq!(
+            fs::read(&source).expect("source should remain readable"),
+            b"source audio"
+        );
     }
 
     #[test]
@@ -4865,6 +5126,45 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
             .lock()
             .expect("encoder cache lock poisoned")
             .is_empty());
+    }
+
+    #[test]
+    fn sqlcipher_bails_before_committing_after_statement_error() {
+        if !command_available("sqlcipher") {
+            eprintln!("skipping sqlcipher bail test because sqlcipher is unavailable");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let db_path = dir.path().join("bail.db");
+        let error = run_sqlcipher(
+            &db_path,
+            DEFAULT_KEY,
+            r#"
+BEGIN IMMEDIATE;
+CREATE TABLE migration_bail_test (value TEXT);
+INSERT INTO migration_bail_test VALUES ('before-error');
+INSERT INTO missing_table VALUES ('boom');
+INSERT INTO migration_bail_test VALUES ('after-error');
+COMMIT;
+"#,
+        )
+        .expect_err("sqlcipher should fail on the missing table");
+
+        assert!(
+            error.contains("missing_table") || error.contains("no such table"),
+            "unexpected sqlcipher error: {error}"
+        );
+
+        let table_count = sqlcipher_required_value(
+            &db_path,
+            DEFAULT_KEY,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migration_bail_test';",
+            "expected table count",
+        )
+        .expect("database should remain readable after failed script");
+
+        assert_eq!(table_count, "0");
     }
 
     #[test]

@@ -11,45 +11,12 @@
   },
   "app": {
     "security": {
-      "csp": null,
+      "csp": "default-src 'self' ipc: http://ipc.localhost; base-uri 'none'; object-src 'none'; frame-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost; media-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost",
+      "devCsp": "default-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420; base-uri 'none'; object-src 'none'; frame-src 'none'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: http://asset.localhost http://127.0.0.1:1420; media-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420",
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$HOME/**",
-          "$DESKTOP/**",
-          "$DOCUMENT/**",
-          "$DOWNLOAD/**",
-          "$PUBLIC/**",
-          "$APPDATA/**",
-          "$APPLOCALDATA/**",
-          "$TEMP/**",
-          "/Volumes/**",
-          "A:/**",
-          "B:/**",
-          "C:/**",
-          "D:/**",
-          "E:/**",
-          "F:/**",
-          "G:/**",
-          "H:/**",
-          "I:/**",
-          "J:/**",
-          "K:/**",
-          "L:/**",
-          "M:/**",
-          "N:/**",
-          "O:/**",
-          "P:/**",
-          "Q:/**",
-          "R:/**",
-          "S:/**",
-          "T:/**",
-          "U:/**",
-          "V:/**",
-          "W:/**",
-          "X:/**",
-          "Y:/**",
-          "Z:/**"
+          "$TEMP/rekordport-preview-cache/**"
         ]
       }
     },
