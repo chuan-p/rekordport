@@ -17,13 +17,13 @@ $allowUnverifiedDownloads = $env:RKB_ALLOW_UNVERIFIED_DOWNLOADS -eq "1"
 
 $pinnedFfmpeg = @{
   "x86_64-pc-windows-msvc" = @{
-    Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-11-14-07/ffmpeg-n8.1-7-ga3475e2554-win64-lgpl-8.1.zip"
-    Sha256 = "ff1e1cd3b015607430b936354478eef3ccb92a68a43e4b5ed2e1634e273e44a5"
+    Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-26-13-08/ffmpeg-n8.1-10-g7f5c90f77e-win64-lgpl-8.1.zip"
+    Sha256 = "d2bcaee1792a39e2bfd2c04a3d88daf53d4e857a6583fed68c03562106f745bd"
     Label = "BtbN FFmpeg win64 LGPL 8.1"
   }
   "aarch64-pc-windows-msvc" = @{
-    Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-11-14-07/ffmpeg-n8.1-7-ga3475e2554-winarm64-lgpl-8.1.zip"
-    Sha256 = "ad048f010d67f9b80c2c3fb1aab3fe94467e97c9070321c3dd978a9c5249cc74"
+    Url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-04-26-13-08/ffmpeg-n8.1-10-g7f5c90f77e-winarm64-lgpl-8.1.zip"
+    Sha256 = "a29d83d01d3a07cfe060af439c803a082a508fd92c662a74d0ee946888ee4c1a"
     Label = "BtbN FFmpeg winarm64 LGPL 8.1"
   }
 }
