@@ -6,8 +6,11 @@ import "./style.css";
 // to import raw files out of src-tauri.
 const appIcon = `${import.meta.env.BASE_URL}app-icon.png`;
 
+const APP_VERSION = import.meta.env.VITE_APP_VERSION || "0.0.0";
 const DEFAULT_MIN_BIT_DEPTH = 16;
+const RELEASES_URL = "https://github.com/chuan-p/rekordport/releases";
 const STORAGE_KEY = "rekordbox-lossless-scan-settings";
+const SKIPPED_UPDATE_KEY = "rekordport-skipped-update-version";
 const IS_MACOS = /\bMac OS X\b|\bMacintosh\b/.test(navigator.userAgent);
 const IS_WINDOWS = /\bWindows\b/.test(navigator.userAgent);
 const PROFILE = {
@@ -31,6 +34,11 @@ const state = {
   preflight: null,
   preflightRequestId: 0,
   scanRequestId: 0,
+  update: {
+    status: "checking",
+    latestVersion: null,
+    url: RELEASES_URL,
+  },
   scanProgress: {
     active: false,
     phase: "idle",
@@ -58,6 +66,7 @@ const state = {
   settings: loadSettings(),
   ui: {
     profileOpen: false,
+    updateOpen: false,
   },
 };
 
@@ -96,7 +105,13 @@ const els = {
   profileKicker: $("profile-kicker"),
   profileName: $("profile-name"),
   profileRole: $("profile-role"),
+  profileVersion: $("profile-version"),
   profileYear: $("profile-year"),
+  updateBackdrop: $("update-backdrop"),
+  updateDialog: $("update-dialog"),
+  updateTitle: $("update-title"),
+  updateDownload: $("update-download"),
+  updateSkip: $("update-skip"),
 };
 
 function loadSettings() {
@@ -226,6 +241,7 @@ function renderProfileCard() {
     !els.profileKicker ||
     !els.profileName ||
     !els.profileRole ||
+    !els.profileVersion ||
     !els.profileYear
   ) {
     return;
@@ -235,6 +251,7 @@ function renderProfileCard() {
   els.profileKicker.textContent = PROFILE.kicker;
   els.profileName.textContent = PROFILE.name;
   els.profileRole.innerHTML = `made by <a href="${escapeHtml(PROFILE.url)}" data-external-link="${escapeHtml(PROFILE.url)}">${escapeHtml(PROFILE.handle)}</a> ${escapeHtml(PROFILE.suffix)}`;
+  els.profileVersion.textContent = `Version v${normalizeVersion(APP_VERSION)}`;
   els.profileYear.textContent = PROFILE.year;
 
   els.profileBackdrop.hidden = !state.ui.profileOpen;
@@ -371,6 +388,98 @@ function environmentSummary() {
     return `Environment ready · ${state.preflight.os}${sourceSummary ? ` · ${sourceSummary}` : ""} · scan and conversion dependencies are available`;
   }
   return state.preflight.warnings.join(" ");
+}
+
+function normalizeVersion(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^v/i, "")
+    .split(/[+-]/)[0];
+}
+
+function compareVersions(left, right) {
+  const leftParts = normalizeVersion(left).split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const rightParts = normalizeVersion(right).split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const maxLength = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < maxLength; index += 1) {
+    const diff = (leftParts[index] || 0) - (rightParts[index] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function renderFooterNote() {
+  els.footerNote.textContent = environmentSummary();
+}
+
+function skippedUpdateVersion() {
+  try {
+    return localStorage.getItem(SKIPPED_UPDATE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function skipUpdateVersion(version) {
+  try {
+    localStorage.setItem(SKIPPED_UPDATE_KEY, version);
+  } catch {
+    // Ignore storage failures; the user can still dismiss this run.
+  }
+}
+
+function shouldPromptForUpdate() {
+  return state.update.status === "available"
+    && Boolean(state.update.latestVersion)
+    && skippedUpdateVersion() !== state.update.latestVersion;
+}
+
+function renderUpdateDialog() {
+  if (
+    !els.updateBackdrop ||
+    !els.updateDialog ||
+    !els.updateTitle ||
+    !els.updateDownload ||
+    !els.updateSkip
+  ) {
+    return;
+  }
+
+  if (!shouldPromptForUpdate()) {
+    state.ui.updateOpen = false;
+  }
+
+  const open = state.ui.updateOpen && shouldPromptForUpdate();
+  els.updateBackdrop.hidden = !open;
+  els.updateDialog.hidden = !open;
+  if (!open) return;
+
+  els.updateTitle.textContent = `rekordport ${state.update.latestVersion} is ready`;
+}
+
+async function checkForUpdates() {
+  state.update = { status: "checking", latestVersion: null, url: RELEASES_URL };
+  renderUpdateDialog();
+
+  try {
+    const release = await invoke("latest_release");
+    const tagName = release?.tag_name || release?.name;
+    const latestVersion = normalizeVersion(tagName);
+    if (!latestVersion) {
+      throw new Error("latest release did not include a tag");
+    }
+    const latestTag = `v${latestVersion}`;
+    state.update = {
+      status: compareVersions(latestVersion, APP_VERSION) > 0 ? "available" : "current",
+      latestVersion: latestTag,
+      url: release?.html_url || RELEASES_URL,
+    };
+  } catch {
+    state.update = { status: "error", latestVersion: null, url: RELEASES_URL };
+  }
+
+  state.ui.updateOpen = shouldPromptForUpdate();
+  renderUpdateDialog();
 }
 
 function humanBytesLike(value) {
@@ -667,7 +776,7 @@ async function invalidateScanState({ clearPreflight = false } = {}) {
   clearConversionMessage();
   if (clearPreflight) {
     state.preflight = null;
-    els.footerNote.textContent = "Checking local dependencies…";
+    renderFooterNote();
   } else {
     applyPreflightState();
   }
@@ -819,7 +928,7 @@ function setLoading(loading, task = null) {
 }
 
 function applyPreflightState() {
-  els.footerNote.textContent = environmentSummary();
+  renderFooterNote();
   const m4aOption = [...els.preset.options].find((option) => option.value === "m4a-320");
   if (!m4aOption) return;
   const m4aAvailable = state.preflight?.m4a_encoder_available ?? true;
@@ -1267,11 +1376,29 @@ async function wireEvents() {
     toggleProfileCard();
   });
   els.profileBackdrop.addEventListener("click", closeProfileCard);
-  els.profileCard.addEventListener("click", async (event) => {
+  els.updateDownload.addEventListener("click", async () => {
+    const url = state.update.url || RELEASES_URL;
+    try {
+      await openExternalUrl(url);
+      state.ui.updateOpen = false;
+      renderUpdateDialog();
+    } catch (error) {
+      setStatus("Error", "", "error");
+      setError(`Could not open update link: ${String(error)}`);
+    }
+  });
+  els.updateSkip.addEventListener("click", () => {
+    if (state.update.latestVersion) {
+      skipUpdateVersion(state.update.latestVersion);
+    }
+    state.ui.updateOpen = false;
+    renderUpdateDialog();
+  });
+  document.addEventListener("click", async (event) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
 
-    const link = target.closest("a[data-external-link]");
+    const link = target.closest("[data-external-link]");
     if (!link) return;
 
     event.preventDefault();
@@ -1287,6 +1414,11 @@ async function wireEvents() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
+      if (state.ui.updateOpen) {
+        state.ui.updateOpen = false;
+        renderUpdateDialog();
+        return;
+      }
       closeProfileCard();
     }
   });
@@ -1308,6 +1440,7 @@ function initialize() {
   });
   saveSettings();
   applyPreflightState();
+  checkForUpdates();
   setStatus("Ready", "", "ready");
   bootstrapDefaultPath().catch((error) => {
     setError(String(error));

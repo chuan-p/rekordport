@@ -30,6 +30,7 @@ mod migration_fixture_tests;
 mod process;
 
 const DEFAULT_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
+const LATEST_RELEASE_URL: &str = "https://github.com/chuan-p/rekordport/releases/latest";
 const HI_RES_SAMPLE_RATE_THRESHOLD: u32 = 48_000;
 const WAV_FORMAT_TAG_PCM: u16 = 0x0001;
 const WAV_FORMAT_TAG_EXTENSIBLE: u16 = 0xFFFE;
@@ -176,6 +177,12 @@ struct PreflightResponse {
     scan_ready: bool,
     convert_ready: bool,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LatestReleaseResponse {
+    tag_name: String,
+    html_url: String,
 }
 
 #[derive(Debug)]
@@ -1667,10 +1674,29 @@ fn parse_optional_u32(value: Option<&str>) -> Option<u32> {
         .and_then(|value| value.parse::<u32>().ok())
 }
 
+fn positive_u32(value: Option<u32>) -> Option<u32> {
+    value.filter(|value| *value > 0)
+}
+
 fn is_hi_res_pcm_row(row: &ScanRow, min_bit_depth: u32) -> bool {
     matches!(row.file_type, 11 | 12)
         && (row.bit_depth.unwrap_or(0) > min_bit_depth
             || row.sample_rate.unwrap_or(0) > HI_RES_SAMPLE_RATE_THRESHOLD)
+}
+
+fn lossless_scan_bitrate(row: &ScanRow) -> Option<u32> {
+    positive_u32(row.bitrate).or_else(|| {
+        if !matches!(row.file_type, 5 | 6) || row.full_path.trim().is_empty() {
+            return None;
+        }
+
+        let source = Path::new(&row.full_path);
+        if !path_exists(source).unwrap_or(false) {
+            return None;
+        }
+
+        positive_u32(probe_audio(source).ok()?.bitrate_kbps)
+    })
 }
 
 fn probe_wav_format_tag(path: &Path) -> Result<Option<u16>, String> {
@@ -1876,6 +1902,7 @@ where
         } else {
             None
         };
+        let bitrate = lossless_scan_bitrate(&row);
 
         tracks.push(Track {
             id: row.id,
@@ -1890,7 +1917,7 @@ where
             codec_name,
             bit_depth: row.bit_depth,
             sample_rate: row.sample_rate,
-            bitrate: row.bitrate,
+            bitrate,
             full_path: row.full_path,
         });
 
@@ -4267,6 +4294,32 @@ fn open_external_url(url: String) -> Result<(), String> {
     }
 }
 
+fn latest_release_impl() -> Result<LatestReleaseResponse, String> {
+    let response = ureq::get(LATEST_RELEASE_URL)
+        .set("User-Agent", concat!("rekordport/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|error| format!("failed to check GitHub releases: {error}"))?;
+
+    let html_url = response.get_url().to_string();
+    let tag_name = html_url
+        .rsplit_once("/releases/tag/")
+        .map(|(_, tag)| tag)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("GitHub latest release did not redirect to a tag: {html_url}"))?;
+
+    Ok(LatestReleaseResponse {
+        tag_name: tag_name.to_string(),
+        html_url,
+    })
+}
+
+#[tauri::command]
+async fn latest_release() -> Result<LatestReleaseResponse, String> {
+    tauri::async_runtime::spawn_blocking(latest_release_impl)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn scan_library(app: tauri::AppHandle, req: ScanRequest) -> Result<ScanResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -4343,6 +4396,7 @@ pub fn run() {
             prepare_preview_path,
             open_path_in_file_manager,
             open_external_url,
+            latest_release,
             scan_library,
             export_tracks,
             rekordbox_process_running,
@@ -4467,6 +4521,38 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
         assert_eq!(probe.sample_rate, Some(44_100));
         assert_eq!(probe.channels, Some(2));
         assert_eq!(probe.bitrate_kbps, Some(1411));
+    }
+
+    #[test]
+    fn lossless_scan_bitrate_ignores_zero_database_value() {
+        let row = ScanRow {
+            id: "1".to_string(),
+            title: "Track".to_string(),
+            artist: "Artist".to_string(),
+            file_type: 5,
+            bit_depth: None,
+            sample_rate: None,
+            bitrate: Some(0),
+            full_path: String::new(),
+        };
+
+        assert_eq!(lossless_scan_bitrate(&row), None);
+    }
+
+    #[test]
+    fn lossless_scan_bitrate_keeps_positive_database_value() {
+        let row = ScanRow {
+            id: "1".to_string(),
+            title: "Track".to_string(),
+            artist: "Artist".to_string(),
+            file_type: 5,
+            bit_depth: None,
+            sample_rate: None,
+            bitrate: Some(2847),
+            full_path: String::new(),
+        };
+
+        assert_eq!(lossless_scan_bitrate(&row), Some(2847));
     }
 
     #[test]

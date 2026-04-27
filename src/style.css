@@ -130,25 +130,26 @@ html.platform-macos .shell {
   flex: 0 0 auto;
 }
 
-.profile-backdrop {
+.profile-backdrop,
+.update-backdrop {
   position: fixed;
   inset: 0;
   z-index: 29;
   background: rgba(11, 11, 13, 0.58);
 }
 
-.profile-backdrop[hidden] {
+.profile-backdrop[hidden],
+.update-backdrop[hidden] {
   display: none;
 }
 
-.profile-card {
+.profile-card,
+.update-dialog {
   position: fixed;
   top: 50%;
   left: 50%;
   z-index: 30;
   width: min(420px, calc(100vw - 32px));
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
   gap: 14px;
   padding: 16px;
   border-radius: 20px;
@@ -158,7 +159,18 @@ html.platform-macos .shell {
   transform: translate(-50%, -50%);
 }
 
-.profile-card[hidden] {
+.profile-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.update-dialog {
+  display: grid;
+  width: min(460px, calc(100vw - 32px));
+}
+
+.profile-card[hidden],
+.update-dialog[hidden] {
   display: none;
 }
 
@@ -202,6 +214,7 @@ html.platform-macos .shell {
 }
 
 .profile-card-role,
+.profile-card-version,
 .profile-card-year {
   margin: 8px 0 0;
   line-height: 1.55;
@@ -220,6 +233,32 @@ html.platform-macos .shell {
 .profile-card-year {
   color: rgba(242, 243, 245, 0.54);
   font-size: 0.82rem;
+}
+
+.profile-card-version {
+  color: rgba(242, 243, 245, 0.72);
+  font-size: 0.82rem;
+}
+
+.update-dialog-kicker {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.update-dialog h3 {
+  margin: 0;
+  font-size: 1.18rem;
+}
+
+.update-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 2px;
 }
 
 .scan-grid {
