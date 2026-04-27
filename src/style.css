@@ -166,7 +166,9 @@ html.platform-macos .shell {
 
 .update-dialog {
   display: grid;
-  width: min(460px, calc(100vw - 32px));
+  width: min(560px, calc(100vw - 32px));
+  gap: 12px;
+  padding: 22px 24px;
 }
 
 .profile-card[hidden],
@@ -243,22 +245,75 @@ html.platform-macos .shell {
 .update-dialog-kicker {
   margin: 0;
   color: var(--muted);
-  font-size: 0.72rem;
-  font-weight: 800;
-  letter-spacing: 0.14em;
+  font-size: 0.68rem;
+  font-weight: 750;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
 .update-dialog h3 {
   margin: 0;
-  font-size: 1.18rem;
+  font-size: 1.04rem;
+  line-height: 1.35;
+}
+
+.update-changelog {
+  max-height: min(260px, 36vh);
+  overflow: auto;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.035);
+  color: rgba(242, 243, 245, 0.78);
+  font-size: 0.82rem;
+  line-height: 1.48;
+}
+
+.update-changelog[hidden] {
+  display: none;
+}
+
+.update-changelog-version + .update-changelog-version {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.update-changelog h4 {
+  margin: 0 0 8px;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.update-changelog h5 {
+  margin: 10px 0 6px;
+  color: rgba(242, 243, 245, 0.7);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.update-changelog ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.update-changelog li + li {
+  margin-top: 5px;
 }
 
 .update-dialog-actions {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
-  margin-top: 2px;
+  margin-top: 4px;
+}
+
+.update-dialog-actions .primary,
+.update-dialog-actions .ghost {
+  padding: 10px 14px;
+  border-radius: 13px;
+  font-size: 0.9rem;
 }
 
 .scan-grid {

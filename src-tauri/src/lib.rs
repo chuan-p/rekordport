@@ -183,6 +183,7 @@ struct PreflightResponse {
 struct LatestReleaseResponse {
     tag_name: String,
     html_url: String,
+    changelog: Option<String>,
 }
 
 #[derive(Debug)]
@@ -4306,11 +4307,24 @@ fn latest_release_impl() -> Result<LatestReleaseResponse, String> {
         .map(|(_, tag)| tag)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("GitHub latest release did not redirect to a tag: {html_url}"))?;
+    let changelog = fetch_release_changelog(tag_name);
 
     Ok(LatestReleaseResponse {
         tag_name: tag_name.to_string(),
         html_url,
+        changelog,
     })
+}
+
+fn fetch_release_changelog(tag_name: &str) -> Option<String> {
+    let url = format!("https://raw.githubusercontent.com/chuan-p/rekordport/{tag_name}/CHANGELOG.md");
+    ureq::get(&url)
+        .set("User-Agent", concat!("rekordport/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()
+        .filter(|text| !text.trim().is_empty())
 }
 
 #[tauri::command]
