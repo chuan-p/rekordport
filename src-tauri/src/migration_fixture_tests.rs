@@ -47,8 +47,26 @@ CREATE TABLE djmdCue (ContentID TEXT, ContentUUID TEXT, updated_at TEXT);
 CREATE TABLE contentActiveCensor (ID TEXT, ContentID TEXT, updated_at TEXT);
 CREATE TABLE djmdActiveCensor (ID TEXT, ContentID TEXT, ContentUUID TEXT, updated_at TEXT);
 CREATE TABLE djmdMixerParam (ContentID TEXT, updated_at TEXT);
-CREATE TABLE djmdPlaylist (ID TEXT, SmartList TEXT);
-CREATE TABLE djmdSongPlaylist (ContentID TEXT, PlaylistID TEXT, updated_at TEXT);
+CREATE TABLE djmdPlaylist (
+  ID TEXT,
+  Name TEXT,
+  Attribute INTEGER,
+  ParentID TEXT,
+  SmartList TEXT,
+  rb_data_status INTEGER,
+  rb_local_data_status INTEGER,
+  rb_local_deleted INTEGER,
+  rb_local_synced INTEGER
+);
+CREATE TABLE djmdSongPlaylist (
+  ID TEXT,
+  ContentID TEXT,
+  PlaylistID TEXT,
+  Seq INTEGER,
+  rb_data_status INTEGER,
+  rb_local_deleted INTEGER,
+  updated_at TEXT
+);
 CREATE TABLE djmdSongMyTag (ContentID TEXT, updated_at TEXT);
 CREATE TABLE djmdSongTagList (ContentID TEXT, updated_at TEXT);
 CREATE TABLE djmdSongHotCueBanklist (ContentID TEXT, updated_at TEXT);
@@ -79,8 +97,16 @@ VALUES (
   1,
   ''
 );
-INSERT INTO djmdPlaylist (ID, SmartList) VALUES ('10', ''), ('11', 'rules');
-INSERT INTO djmdSongPlaylist (ContentID, PlaylistID, updated_at) VALUES ('1', '10', ''), ('1', '11', '');
+INSERT INTO djmdPlaylist
+  (ID, Name, Attribute, ParentID, SmartList, rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced)
+VALUES
+  ('10', 'Existing Playlist', -128, 'root', '', 258, 0, 1, 0),
+  ('11', 'Smart Playlist', 1, 'root', 'rules', 0, 0, 0, 0);
+INSERT INTO djmdSongPlaylist
+  (ID, ContentID, PlaylistID, Seq, rb_data_status, rb_local_deleted, updated_at)
+VALUES
+  ('row-1', '1', '10', 1, 0, 0, ''),
+  ('row-2', '1', '11', 1, 0, 0, '');
 INSERT INTO contentCue (ID, ContentID, Cues, rb_cue_count, updated_at)
 VALUES (
   'old-uuid',
@@ -180,6 +206,58 @@ VALUES (
     assert_eq!(new_content_count, "1");
     assert_eq!(standard_playlist_count, "1");
     assert_eq!(smart_playlist_old_count, "1");
+
+    let review_playlist_name =
+        create_conversion_review_playlist(&db_path, DEFAULT_KEY, migrated.as_slice())
+            .expect("review playlist should be creatable")
+            .expect("review playlist should be created");
+    let review_playlist_count = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT COUNT(*) FROM djmdPlaylist WHERE Name = {};",
+            sql_quote(&review_playlist_name)
+        ),
+        "expected review playlist count",
+    )
+    .expect("review playlist query should succeed");
+    let review_playlist_track_count = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT COUNT(*) FROM djmdSongPlaylist WHERE ContentID = {} AND PlaylistID IN (SELECT ID FROM djmdPlaylist WHERE Name = {});",
+            sql_quote(&new_id),
+            sql_quote(&review_playlist_name)
+        ),
+        "expected review playlist track count",
+    )
+    .expect("review playlist track query should succeed");
+    let review_playlist_state = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT Attribute || '|' || ParentID || '|' || rb_data_status || '|' || rb_local_deleted FROM djmdPlaylist WHERE Name = {};",
+            sql_quote(&review_playlist_name)
+        ),
+        "expected review playlist state",
+    )
+    .expect("review playlist state query should succeed");
+    let review_playlist_track_state = sqlcipher_required_value(
+        &db_path,
+        DEFAULT_KEY,
+        &format!(
+            "SELECT rb_data_status || '|' || rb_local_deleted FROM djmdSongPlaylist WHERE ContentID = {} AND PlaylistID IN (SELECT ID FROM djmdPlaylist WHERE Name = {});",
+            sql_quote(&new_id),
+            sql_quote(&review_playlist_name)
+        ),
+        "expected review playlist track state",
+    )
+    .expect("review playlist track state query should succeed");
+
+    assert_eq!(review_playlist_count, "1");
+    assert_eq!(review_playlist_track_count, "1");
+    assert_eq!(review_playlist_state, "0|root|0|0");
+    assert_eq!(review_playlist_track_state, "0|0");
 
     let migrated_content_cue_id = sqlcipher_required_value(
         &db_path,

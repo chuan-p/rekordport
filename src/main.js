@@ -1,6 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import "./style.css";
 
 // Keep the About card icon inside Vite's public assets so dev mode never tries
 // to import raw files out of src-tauri.
@@ -14,7 +13,7 @@ const SKIPPED_UPDATE_KEY = "rekordport-skipped-update-version";
 const IS_MACOS = /\bMac OS X\b|\bMacintosh\b/.test(navigator.userAgent);
 const IS_WINDOWS = /\bWindows\b/.test(navigator.userAgent);
 const PROFILE = {
-  kicker: "About",
+  kicker: "Info",
   name: "rekordport",
   handle: "@chuan_p",
   url: "https://www.instagram.com/chuan_p/",
@@ -29,6 +28,7 @@ const state = {
   scanSummary: null,
   selectedIds: new Set(),
   conversionCompleted: false,
+  lastBackupDir: "",
   loading: false,
   loadingTask: null,
   preflight: null,
@@ -107,6 +107,7 @@ const els = {
   profileName: $("profile-name"),
   profileRole: $("profile-role"),
   profileVersion: $("profile-version"),
+  profileBackup: $("profile-backup"),
   profileYear: $("profile-year"),
   updateBackdrop: $("update-backdrop"),
   updateDialog: $("update-dialog"),
@@ -225,7 +226,7 @@ function renderConvertButton() {
   const convertReady = state.preflight ? state.preflight.convert_ready : true;
 
   if (!state.loading && selectedCount === 0 && state.conversionCompleted) {
-    els.convert.textContent = "Conversion Completed";
+    els.convert.textContent = "Converted";
     els.convert.disabled = true;
     return;
   }
@@ -244,6 +245,7 @@ function renderProfileCard() {
     !els.profileName ||
     !els.profileRole ||
     !els.profileVersion ||
+    !els.profileBackup ||
     !els.profileYear
   ) {
     return;
@@ -254,6 +256,13 @@ function renderProfileCard() {
   els.profileName.textContent = PROFILE.name;
   els.profileRole.innerHTML = `made by <a href="${escapeHtml(PROFILE.url)}" data-external-link="${escapeHtml(PROFILE.url)}">${escapeHtml(PROFILE.handle)}</a> ${escapeHtml(PROFILE.suffix)}`;
   els.profileVersion.textContent = `Version v${normalizeVersion(APP_VERSION)}`;
+  if (state.lastBackupDir) {
+    els.profileBackup.hidden = false;
+    els.profileBackup.innerHTML = `Backup <button class="footer-link" type="button" data-backup-path="${escapeHtml(state.lastBackupDir)}" title="${escapeHtml(state.lastBackupDir)}">Open</button>`;
+  } else {
+    els.profileBackup.hidden = true;
+    els.profileBackup.textContent = "";
+  }
   els.profileYear.textContent = PROFILE.year;
 
   els.profileBackdrop.hidden = !state.ui.profileOpen;
@@ -366,8 +375,13 @@ function normalizeConflictResolution(value) {
   return "error";
 }
 
+function numberOrZero(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
 function formatNumber(value) {
-  return new Intl.NumberFormat("en-US").format(value);
+  return new Intl.NumberFormat("en-US").format(numberOrZero(value));
 }
 
 function dependencySourceSummary() {
@@ -608,7 +622,9 @@ async function checkForUpdates() {
 
 function humanBytesLike(value) {
   if (value == null || value === "") return "—";
-  return String(value);
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "—";
+  return String(numeric);
 }
 
 function analysisStateLabel(track) {
@@ -638,10 +654,11 @@ function formatAudioMeta(track) {
   const bitDepth = humanBytesLike(track.bit_depth);
   const sampleRate = humanBytesLike(track.sample_rate);
   const bitrate = humanBytesLike(track.bitrate);
+  const sampleRateValue = Number(sampleRate);
   const sampleRateLabel = sampleRate === "—"
     ? "—"
-    : Number(sampleRate) >= 1000
-      ? `${(Number(sampleRate) / 1000).toFixed(Number(sampleRate) % 1000 === 0 ? 0 : 1)}k`
+    : sampleRateValue >= 1000
+      ? `${(sampleRateValue / 1000).toFixed(sampleRateValue % 1000 === 0 ? 0 : 1)}k`
       : sampleRate;
   const items = [
     `<span><strong>${escapeHtml(bitDepth)}</strong>-bit</span>`,
@@ -914,10 +931,44 @@ function summarizeTracks(tracks) {
   const flac = tracks.filter((t) => t.file_type === "FLAC").length;
   const alac = tracks.filter((t) => t.file_type === "ALAC").length;
   const wavExtensible = tracks.filter((t) => t.scan_issue === "wav_extensible").length;
-  const hires = tracks.filter(
+  const hiRes = tracks.filter(
     (t) => (t.file_type === "WAV" || t.file_type === "AIFF") && t.scan_issue !== "wav_extensible",
   ).length;
-  return { total: tracks.length, flac, alac, hires, wav_extensible: wavExtensible };
+  return {
+    library_total: tracks.length,
+    candidate_total: tracks.length,
+    total: tracks.length,
+    flac,
+    alac,
+    hi_res: hiRes,
+    wav_extensible: wavExtensible,
+    m4a_candidates: alac,
+    unreadable_m4a: 0,
+    non_alac_m4a: 0,
+    sampler_included: false,
+    min_bit_depth: DEFAULT_MIN_BIT_DEPTH,
+    db_path: "",
+  };
+}
+
+function normalizeScanSummary(summary, tracks = []) {
+  const fallback = summarizeTracks(tracks);
+  const source = summary || {};
+  return {
+    library_total: numberOrZero(source.library_total ?? fallback.library_total),
+    candidate_total: numberOrZero(source.candidate_total ?? fallback.candidate_total),
+    total: numberOrZero(source.total ?? fallback.total),
+    flac: numberOrZero(source.flac ?? fallback.flac),
+    alac: numberOrZero(source.alac ?? fallback.alac),
+    hi_res: numberOrZero(source.hi_res ?? source.hires ?? fallback.hi_res),
+    wav_extensible: numberOrZero(source.wav_extensible ?? fallback.wav_extensible),
+    m4a_candidates: numberOrZero(source.m4a_candidates ?? fallback.m4a_candidates),
+    unreadable_m4a: numberOrZero(source.unreadable_m4a ?? fallback.unreadable_m4a),
+    non_alac_m4a: numberOrZero(source.non_alac_m4a ?? fallback.non_alac_m4a),
+    sampler_included: Boolean(source.sampler_included ?? fallback.sampler_included),
+    min_bit_depth: numberOrZero(source.min_bit_depth ?? fallback.min_bit_depth),
+    db_path: source.db_path || fallback.db_path,
+  };
 }
 
 function selectedTracks() {
@@ -936,7 +987,7 @@ function renderSummary() {
     summary.candidate_total ? `Candidates ${formatNumber(summary.candidate_total)}` : null,
     `FLAC ${formatNumber(summary.flac)}`,
     `ALAC ${formatNumber(summary.alac)}`,
-    `Hi-Res ${formatNumber(summary.hires)}`,
+    `Hi-Res ${formatNumber(summary.hi_res)}`,
     summary.wav_extensible ? `WAV_EXT ${formatNumber(summary.wav_extensible)}` : null,
     summary.unreadable_m4a ? `Unreadable M4A ${formatNumber(summary.unreadable_m4a)}` : null,
   ];
@@ -1146,27 +1197,28 @@ async function scan() {
       analysis_state: track.analysis_state || null,
       analysis_note: track.analysis_note || "",
     }));
-    state.scanSummary = response.summary || null;
+    const summary = response.summary ? normalizeScanSummary(response.summary, state.tracks) : null;
+    state.scanSummary = summary;
     state.selectedIds = new Set();
     state.conversionCompleted = false;
     setStatus("Scanned", "", "ready");
-    if (response.summary?.library_total) {
+    if (summary?.library_total) {
       const noteParts = [
-        `Scanned ${formatNumber(response.summary.candidate_total || 0)} candidate tracks from ${formatNumber(response.summary.library_total)} library entries.`,
+        `Scanned ${formatNumber(summary.candidate_total)} candidate tracks from ${formatNumber(summary.library_total)} library entries.`,
       ];
-      if (response.summary.unreadable_m4a) {
+      if (summary.unreadable_m4a) {
         noteParts.push(
-          `${formatNumber(response.summary.unreadable_m4a)} M4A candidates could not be read at their stored paths.`
+          `${formatNumber(summary.unreadable_m4a)} M4A candidates could not be read at their stored paths.`
         );
       }
-      if (response.summary.non_alac_m4a) {
+      if (summary.non_alac_m4a) {
         noteParts.push(
-          `${formatNumber(response.summary.non_alac_m4a)} M4A candidates were not ALAC.`
+          `${formatNumber(summary.non_alac_m4a)} M4A candidates were not ALAC.`
         );
       }
-      if (response.summary.wav_extensible) {
+      if (summary.wav_extensible) {
         noteParts.push(
-          `${formatNumber(response.summary.wav_extensible)} WAV files use WAVE_FORMAT_EXTENSIBLE headers that some CDJ/XDJ players reject.`
+          `${formatNumber(summary.wav_extensible)} WAV files use WAVE_FORMAT_EXTENSIBLE headers that some CDJ/XDJ players reject.`
         );
       }
       els.footerNote.textContent = noteParts.join(" ");
@@ -1258,24 +1310,28 @@ async function convertSelected(conflictResolution = "error") {
     }
     state.selectedIds = new Set();
     state.conversionCompleted = true;
+    const convertedCount = numberOrZero(response.converted_count);
+    const cleanupArchivedDirs = numberOrZero(response.cleanup_archived_dirs);
+    const sourceCleanupFailures = numberOrZero(response.source_cleanup_failures);
     setStatus(
       "Converted",
-      `${response.converted_count} converted · ${response.analysis_migrated_count} analysis sets migrated`,
+      "",
       "ready",
     );
-    const cleanupText = response.cleanup_archived_dirs > 0
-      ? ` Archived ${response.cleanup_archived_dirs} old empty analysis folders${response.cleanup_archive_dir ? ` (${response.cleanup_archive_dir})` : ""}.`
+    const backupDir = response.backup_dir ? String(response.backup_dir) : "";
+    state.lastBackupDir = backupDir;
+    const cleanupText = cleanupArchivedDirs > 0
+      ? ` Archived ${formatNumber(cleanupArchivedDirs)} old empty analysis folders${response.cleanup_archive_dir ? ` (${response.cleanup_archive_dir})` : ""}.`
       : "";
     const warningText = Array.isArray(response.warnings) && response.warnings.length > 0
-      ? ` ${response.warnings.join(" ")}`
+      ? ` ${response.warnings.map((warning) => String(warning)).join(" ")}`
       : "";
-    const sourceHandlingText = response.source_cleanup_mode === "trash"
-      ? response.source_cleanup_failures > 0
-        ? `Source files were moved to Trash where possible; ${response.source_cleanup_failures} file(s) could not be removed and were kept in place.`
-        : "Source files were moved to Trash."
-      : "Source files were renamed and kept in place.";
+    const sourceCleanupText = sourceCleanupFailures > 0
+      ? ` ${formatNumber(sourceCleanupFailures)} source archive(s) could not be moved to Trash.`
+      : "";
     els.footerCopy.hidden = false;
-    els.footerCopy.textContent = `Conversion complete: ${response.converted_count} new file(s) were written. ${sourceHandlingText} Old entries were removed and standard playlists were rebound.${cleanupText}${warningText}`;
+    els.footerCopy.textContent = `Converted ${formatNumber(convertedCount)} file(s).${sourceCleanupText}${cleanupText}${warningText}`;
+    renderProfileCard();
     renderSummary();
     renderChips();
     renderResults();
@@ -1310,8 +1366,8 @@ async function wireEvents() {
     setScanProgress({
       active: payload.phase !== "done" && payload.phase !== "error",
       phase: payload.phase || "processing",
-      current: Number(payload.current || 0),
-      total: Number(payload.total || 0),
+      current: numberOrZero(payload.current),
+      total: numberOrZero(payload.total),
       message: payload.message || "Scanning…",
     });
     if (payload.phase === "querying" || payload.phase === "processing") {
@@ -1324,8 +1380,8 @@ async function wireEvents() {
     setConvertProgress({
       active: payload.phase !== "done" && payload.phase !== "error",
       phase: payload.phase || "processing",
-      current: Number(payload.current || 0),
-      total: Number(payload.total || 0),
+      current: numberOrZero(payload.current),
+      total: numberOrZero(payload.total),
       message: payload.message || "Converting…",
     });
     if (payload.phase === "preparing" || payload.phase === "processing" || payload.phase === "migrating") {
@@ -1398,6 +1454,23 @@ async function wireEvents() {
       }
     }
   });
+  els.profileCard.addEventListener("click", async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+
+    const button = target.closest("button[data-backup-path]");
+    if (!button) return;
+
+    const path = button.dataset.backupPath;
+    if (!path) return;
+
+    try {
+      await openPathInFileManager(path);
+    } catch (error) {
+      setStatus("Error", "", "error");
+      setError(String(error));
+    }
+  });
   els.body.addEventListener("change", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement) || target.type !== "checkbox" || !target.dataset.id) {
@@ -1468,18 +1541,18 @@ async function wireEvents() {
   els.playerPlay.addEventListener("click", togglePreviewPlay);
   els.playerSeek.addEventListener("pointerdown", () => {
     state.player.seeking = true;
-    state.player.seekValue = Number(els.playerSeek.value);
+    state.player.seekValue = numberOrZero(els.playerSeek.value);
     renderPlayer();
   });
   els.playerSeek.addEventListener("input", () => {
     if (!previewTrack()) return;
     state.player.seeking = true;
-    state.player.seekValue = Number(els.playerSeek.value);
+    state.player.seekValue = numberOrZero(els.playerSeek.value);
     renderPlayer();
   });
   els.playerSeek.addEventListener("change", () => {
     if (!previewTrack()) return;
-    const nextTime = Number(els.playerSeek.value);
+    const nextTime = numberOrZero(els.playerSeek.value);
     els.previewAudio.currentTime = nextTime;
     state.player.currentTime = nextTime;
     state.player.seekValue = nextTime;
@@ -1488,7 +1561,7 @@ async function wireEvents() {
   });
   els.playerSeek.addEventListener("pointerup", () => {
     if (!previewTrack()) return;
-    const nextTime = Number(els.playerSeek.value);
+    const nextTime = numberOrZero(els.playerSeek.value);
     els.previewAudio.currentTime = nextTime;
     state.player.currentTime = nextTime;
     state.player.seekValue = nextTime;

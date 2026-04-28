@@ -15,6 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -155,6 +156,7 @@ struct ConvertResponse {
     converted_count: usize,
     analysis_migrated_count: usize,
     analysis_missing_count: usize,
+    verification_playlist_name: Option<String>,
     source_cleanup_mode: String,
     source_cleanup_failures: usize,
     cleanup_archived_dirs: usize,
@@ -252,6 +254,8 @@ struct ScanRow {
     sample_rate: Option<u32>,
     bitrate: Option<u32>,
     full_path: String,
+    file_name_l: String,
+    file_name_s: String,
 }
 
 #[derive(Debug, Default)]
@@ -280,6 +284,7 @@ struct AudioProbe {
     sample_rate: Option<u32>,
     channels: Option<u32>,
     bitrate_kbps: Option<u32>,
+    duration_seconds: Option<f64>,
     has_attached_pic: bool,
 }
 
@@ -300,6 +305,7 @@ static COMMAND_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = O
 static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static AUDIO_PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, AudioProbeCacheEntry>>> = OnceLock::new();
 static CONVERSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TIMESTAMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn refresh_command_discovery_caches() {
     if let Some(cache) = COMMAND_CACHE.get() {
@@ -765,6 +771,13 @@ fn remove_file_path(path: &Path) -> Result<(), String> {
     })
 }
 
+fn remove_dir_all_path(path: &Path) -> Result<(), String> {
+    retry_io_operation(
+        format!("failed to remove directory {}", path.display()),
+        || fs::remove_dir_all(path),
+    )
+}
+
 fn create_dir_all_path(path: &Path) -> Result<(), String> {
     retry_io_operation(
         format!("failed to create directory {}", path.display()),
@@ -1154,11 +1167,16 @@ fn sql_quote(value: &str) -> String {
 }
 
 fn timestamp_token() -> String {
-    let secs = SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    secs.to_string()
+    let sequence = TIMESTAMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{millis}-{sequence}")
+}
+
+fn playlist_timestamp_label() -> String {
+    chrono::Local::now().format("%m-%d %H:%M").to_string()
 }
 
 fn conflict_resolution_mode(value: Option<&str>) -> Result<ConflictResolution, String> {
@@ -1318,6 +1336,48 @@ fn parse_number_after_marker(text: &str, marker: &str) -> Option<u32> {
     }
 }
 
+fn parse_ffmpeg_duration_seconds(text: &str) -> Option<f64> {
+    let (_, rest) = text.split_once("Duration:")?;
+    let value = rest.split(',').next()?.trim();
+    if value.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+
+    let mut parts = value.split(':');
+    let hours = parts.next()?.parse::<f64>().ok()?;
+    let minutes = parts.next()?.parse::<f64>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let duration = (hours * 3600.0) + (minutes * 60.0) + seconds;
+    (duration > 0.0).then_some(duration)
+}
+
+fn bitrate_kbps_from_size_and_duration(file_len: u64, duration_seconds: f64) -> Option<u32> {
+    if file_len == 0 || !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return None;
+    }
+
+    let bitrate = (((file_len as f64) * 8.0) / duration_seconds / 1000.0).round();
+    if bitrate > 0.0 && bitrate <= u32::MAX as f64 {
+        Some(bitrate as u32)
+    } else {
+        None
+    }
+}
+
+fn fill_audio_probe_bitrate_from_file_size(probe: &mut AudioProbe, file_len: u64) {
+    if probe.bitrate_kbps.is_some() {
+        return;
+    }
+
+    probe.bitrate_kbps = probe
+        .duration_seconds
+        .and_then(|duration| bitrate_kbps_from_size_and_duration(file_len, duration));
+}
+
 fn parse_audio_channels(text: &str) -> Option<u32> {
     let lower = text.to_ascii_lowercase();
     if let Some(value) = parse_number_before_marker(&lower, " channels") {
@@ -1349,6 +1409,7 @@ fn parse_ffmpeg_audio_probe(text: &str) -> AudioProbe {
         channels: audio_line.and_then(parse_audio_channels),
         bitrate_kbps: parse_number_before_marker(probe_text, " kb/s")
             .or_else(|| parse_number_after_marker(text, "bitrate:")),
+        duration_seconds: parse_ffmpeg_duration_seconds(text),
         has_attached_pic: text.lines().any(|line| {
             let lower = line.to_ascii_lowercase();
             lower.contains("video:") && lower.contains("attached pic")
@@ -1396,7 +1457,8 @@ fn probe_audio(path: &Path) -> Result<AudioProbe, String> {
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );
-    let probe = parse_ffmpeg_audio_probe(&text);
+    let mut probe = parse_ffmpeg_audio_probe(&text);
+    fill_audio_probe_bitrate_from_file_size(&mut probe, signature.len);
 
     let mut guard = cache.lock().expect("audio probe cache lock poisoned");
     guard.insert(
@@ -1652,7 +1714,7 @@ fn lossless_scan_bitrate(row: &ScanRow) -> Option<u32> {
         }
 
         let source = Path::new(&row.full_path);
-        if !path_exists(source).unwrap_or(false) {
+        if !path_is_file(source) {
             return None;
         }
 
@@ -1727,6 +1789,78 @@ fn sampler_path_predicate(column: &str) -> String {
     format!(r"REPLACE(COALESCE({column}, ''), '\', '/') NOT LIKE '%/Sampler/%'")
 }
 
+fn percent_decode_path_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+fn normalize_rekordbox_path_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let path = trimmed
+        .strip_prefix("file://localhost")
+        .or_else(|| trimmed.strip_prefix("file://"))
+        .unwrap_or(trimmed);
+    let decoded = percent_decode_path_value(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        let bytes = decoded.as_bytes();
+        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
+            return decoded[1..].to_string();
+        }
+    }
+
+    decoded
+}
+
+fn path_is_file(path: &Path) -> bool {
+    metadata_path(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn resolve_rekordbox_audio_path(folder_path: &str, file_name_l: &str, file_name_s: &str) -> String {
+    let base = normalize_rekordbox_path_value(folder_path);
+    if base.is_empty() {
+        return String::new();
+    }
+
+    let base_path = PathBuf::from(&base);
+    if path_is_file(&base_path) {
+        return base;
+    }
+
+    for file_name in [file_name_l, file_name_s] {
+        let file_name = normalize_rekordbox_path_value(file_name);
+        if file_name.is_empty() {
+            continue;
+        }
+
+        let candidate = base_path.join(file_name);
+        if path_is_file(&candidate) {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+
+    base
+}
+
 fn build_scan_query(min_bit_depth: u32, include_sampler: bool) -> String {
     let sampler_filter = if include_sampler {
         String::new()
@@ -1735,7 +1869,7 @@ fn build_scan_query(min_bit_depth: u32, include_sampler: bool) -> String {
     };
 
     format!(
-        ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 6\n    OR c.FileType = 11\n    OR (\n      c.FileType = 12\n      AND (\n        COALESCE(c.BitDepth, 0) > {min_bit_depth}\n        OR COALESCE(c.SampleRate, 0) > {HI_RES_SAMPLE_RATE_THRESHOLD}\n      )\n    )\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
+        ".headers on\n.mode csv\nSELECT\n  COALESCE(c.ID, '') AS id,\n  COALESCE(c.Title, '') AS title,\n  COALESCE(a.Name, c.SrcArtistName, '') AS artist,\n  c.FileType AS file_type,\n  c.BitDepth AS bit_depth,\n  c.SampleRate AS sample_rate,\n  c.BitRate AS bitrate,\n  COALESCE(c.FolderPath, '') AS full_path,\n  COALESCE(c.FileNameL, '') AS file_name_l,\n  COALESCE(c.FileNameS, '') AS file_name_s\nFROM djmdContent c\nLEFT JOIN djmdArtist a ON a.ID = c.ArtistID\nWHERE\n  (\n    c.FileType = 5\n    OR c.FileType = 6\n    OR c.FileType = 11\n    OR (\n      c.FileType = 12\n      AND (\n        COALESCE(c.BitDepth, 0) > {min_bit_depth}\n        OR COALESCE(c.SampleRate, 0) > {HI_RES_SAMPLE_RATE_THRESHOLD}\n      )\n    )\n  ){sampler_filter}\nORDER BY\n  artist COLLATE NOCASE,\n  title COLLATE NOCASE,\n  full_path COLLATE NOCASE;"
     )
 }
 
@@ -1786,6 +1920,8 @@ fn scan_rows(
             sample_rate: parse_optional_u32(record.get(5)),
             bitrate: parse_optional_u32(record.get(6)),
             full_path: record.get(7).unwrap_or_default().to_string(),
+            file_name_l: record.get(8).unwrap_or_default().to_string(),
+            file_name_s: record.get(9).unwrap_or_default().to_string(),
         });
     }
 
@@ -1826,10 +1962,13 @@ where
         let mut scan_issue = None;
         let mut scan_note = None;
         let mut include_track = matches!(row.file_type, 5 | 6) || hi_res_pcm;
+        let full_path =
+            resolve_rekordbox_audio_path(&row.full_path, &row.file_name_l, &row.file_name_s);
+        let row = ScanRow { full_path, ..row };
 
         if row.file_type == 11 && !hi_res_pcm && !row.full_path.trim().is_empty() {
             let source = Path::new(&row.full_path);
-            if path_exists(source).unwrap_or(false) {
+            if path_is_file(source) {
                 if let Some(WAV_FORMAT_TAG_EXTENSIBLE) =
                     probe_wav_format_tag(source).unwrap_or(None)
                 {
@@ -2534,6 +2673,17 @@ fn schema_has_column(schema: &HashMap<String, Vec<String>>, table: &str, column:
         .is_some_and(|columns| has_column(columns, column))
 }
 
+fn next_numeric_text_id(db_path: &Path, key: &str, table: &str) -> Result<String, String> {
+    sqlcipher_required_value(
+        db_path,
+        key,
+        &format!(
+            "SELECT CAST(COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 AS TEXT) FROM {table} WHERE ID GLOB '[0-9]*';"
+        ),
+        &format!("expected next id for {table}"),
+    )
+}
+
 fn updated_at_assignment(
     schema: &HashMap<String, Vec<String>>,
     table: &str,
@@ -2944,12 +3094,10 @@ fn validate_analysis_resources(
         }
 
         if let Some(expected_size) = file.size {
-            if expected_size == 0 || expected_size != actual_size {
+            if expected_size == 0 {
                 return Err(format!(
-                    "analysis resource size mismatch for {} (db {}, disk {})",
-                    source.display(),
-                    expected_size,
-                    actual_size
+                    "analysis resource size is empty for {}",
+                    source.display()
                 ));
             }
         }
@@ -2959,16 +3107,6 @@ fn validate_analysis_resources(
                 return Err(format!(
                     "analysis resource hash is empty for {}",
                     source.display()
-                ));
-            }
-
-            let actual_hash = md5_hex(&source)?;
-            if expected_hash != &actual_hash {
-                return Err(format!(
-                    "analysis resource hash mismatch for {} (db {}, disk {})",
-                    source.display(),
-                    expected_hash,
-                    actual_hash
                 ));
             }
         }
@@ -3203,7 +3341,7 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     let m4a_encoder_available = ffmpeg_has_encoder("aac_at").unwrap_or(false);
     let png_encoder_available = ffmpeg_has_encoder("png").unwrap_or(false);
     let db_exists = !db_path.is_empty() && db_path_buf.exists();
-    let db_readable = if db_exists {
+    let mut db_readable = if db_exists {
         check_database_readable(&db_path_buf, DEFAULT_KEY)
     } else {
         false
@@ -3212,10 +3350,11 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     let mut warnings = Vec::new();
     if db_exists {
         if let Some(backup_parent) = db_path_buf.parent() {
-            match conversion_session::recover_stale_conversion_backups(backup_parent) {
+            match conversion_session::recover_stale_conversion_backups(backup_parent, &db_path_buf) {
                 Ok(report) => {
                     warnings.extend(report.warnings);
                     warnings.extend(report.errors);
+                    db_readable = check_database_readable(&db_path_buf, DEFAULT_KEY);
                 }
                 Err(error) => warnings.push(format!(
                     "failed to recover interrupted conversion backups while checking this library: {}",
@@ -3226,6 +3365,20 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
                 Ok(report) => warnings.extend(report.warnings),
                 Err(error) => warnings.push(format!(
                     "failed to clean completed conversion backups while checking this library: {}",
+                    error
+                )),
+            }
+            match conversion_session::cleanup_successful_music_backups(backup_parent) {
+                Ok(report) => warnings.extend(report.warnings),
+                Err(error) => warnings.push(format!(
+                    "failed to clean successful music backups while checking this library: {}",
+                    error
+                )),
+            }
+            match conversion_session::cleanup_successful_database_backups(backup_parent, 1) {
+                Ok(report) => warnings.extend(report.warnings),
+                Err(error) => warnings.push(format!(
+                    "failed to clean old database backups while checking this library: {}",
                     error
                 )),
             }
@@ -3565,6 +3718,163 @@ fn convert_one_track(
         archive_path,
         skipped_embedded_artwork,
     ))
+}
+
+fn conversion_review_playlist_name() -> String {
+    format!("rekordport Converted {}", playlist_timestamp_label())
+}
+
+fn create_conversion_review_playlist(
+    db_path: &Path,
+    key: &str,
+    tracks: &[Track],
+) -> Result<Option<String>, String> {
+    if tracks.is_empty() {
+        return Ok(None);
+    }
+
+    let schema_columns = table_columns_map(db_path, key, &["djmdPlaylist", "djmdSongPlaylist"])?;
+    let playlist_columns = schema_columns
+        .get("djmdPlaylist")
+        .ok_or_else(|| "missing djmdPlaylist schema".to_string())?;
+    let song_playlist_columns = schema_columns
+        .get("djmdSongPlaylist")
+        .ok_or_else(|| "missing djmdSongPlaylist schema".to_string())?;
+
+    for (table, columns) in [
+        ("djmdPlaylist", playlist_columns),
+        ("djmdSongPlaylist", song_playlist_columns),
+    ] {
+        if !has_column(columns, "ID") && table == "djmdPlaylist" {
+            return Err("djmdPlaylist is missing ID column".to_string());
+        }
+    }
+    if !has_column(playlist_columns, "Name") {
+        return Err("djmdPlaylist is missing Name column".to_string());
+    }
+    if !has_column(song_playlist_columns, "ContentID")
+        || !has_column(song_playlist_columns, "PlaylistID")
+    {
+        return Err("djmdSongPlaylist is missing ContentID or PlaylistID column".to_string());
+    }
+
+    let playlist_id = next_numeric_text_id(db_path, key, "djmdPlaylist")?;
+    let playlist_uuid = Uuid::new_v4().to_string();
+    let playlist_name = conversion_review_playlist_name();
+    let now_expr = "strftime('%Y-%m-%d %H:%M:%f +00:00','now')";
+    let sequence_expr = "COALESCE((SELECT MAX(CAST(Seq AS INTEGER)) FROM djmdPlaylist), 0) + 1";
+    let mut playlist_columns_to_insert = Vec::new();
+    for column in playlist_columns {
+        if matches!(
+            column.as_str(),
+            "ID" | "Seq"
+                | "Name"
+                | "ImagePath"
+                | "Attribute"
+                | "ParentID"
+                | "SmartList"
+                | "UUID"
+                | "rb_data_status"
+                | "rb_local_data_status"
+                | "rb_local_deleted"
+                | "rb_local_synced"
+                | "usn"
+                | "rb_local_usn"
+                | "created_at"
+                | "updated_at"
+        ) {
+            playlist_columns_to_insert.push(column.clone());
+        }
+    }
+    let playlist_values: Vec<String> = playlist_columns_to_insert
+        .iter()
+        .map(|column| match column.as_str() {
+            "ID" => sql_quote(&playlist_id),
+            "Seq" => sequence_expr.to_string(),
+            "Name" => sql_quote(&playlist_name),
+            "ImagePath" | "SmartList" => "''".to_string(),
+            "Attribute" => "0".to_string(),
+            "ParentID" => sql_quote("root"),
+            "UUID" => sql_quote(&playlist_uuid),
+            "rb_data_status" | "rb_local_data_status" | "rb_local_deleted" | "rb_local_synced" => {
+                "0".to_string()
+            }
+            "usn" | "rb_local_usn" => "NULL".to_string(),
+            "created_at" | "updated_at" => now_expr.to_string(),
+            _ => unreachable!("playlist insert columns are filtered"),
+        })
+        .collect();
+
+    let mut song_playlist_columns_to_insert = Vec::new();
+    for column in song_playlist_columns {
+        if matches!(
+            column.as_str(),
+            "ID" | "UUID"
+                | "ContentID"
+                | "PlaylistID"
+                | "TrackNo"
+                | "Seq"
+                | "rb_data_status"
+                | "rb_local_data_status"
+                | "rb_local_deleted"
+                | "rb_local_synced"
+                | "usn"
+                | "rb_local_usn"
+                | "created_at"
+                | "updated_at"
+        ) {
+            song_playlist_columns_to_insert.push(column.clone());
+        }
+    }
+
+    let mut sql = String::from("BEGIN IMMEDIATE;\n");
+    sql.push_str(&format!(
+        "INSERT INTO djmdPlaylist ({columns}) VALUES ({values});\n",
+        columns = playlist_columns_to_insert.join(", "),
+        values = playlist_values.join(", "),
+    ));
+
+    for (index, track) in tracks.iter().enumerate() {
+        let mut values = Vec::new();
+        let row_uuid = Uuid::new_v4().to_string();
+        for column in &song_playlist_columns_to_insert {
+            values.push(match column.as_str() {
+                "ID" | "UUID" => sql_quote(&row_uuid),
+                "ContentID" => sql_quote(&track.id),
+                "PlaylistID" => sql_quote(&playlist_id),
+                "TrackNo" | "Seq" => (index + 1).to_string(),
+                "rb_data_status"
+                | "rb_local_data_status"
+                | "rb_local_deleted"
+                | "rb_local_synced" => "0".to_string(),
+                "usn" | "rb_local_usn" => "NULL".to_string(),
+                "created_at" | "updated_at" => now_expr.to_string(),
+                _ => unreachable!("song playlist insert columns are filtered"),
+            });
+        }
+        sql.push_str(&format!(
+            "INSERT INTO djmdSongPlaylist ({columns}) SELECT {values} WHERE EXISTS (SELECT 1 FROM djmdPlaylist WHERE ID = {playlist_id});\n",
+            columns = song_playlist_columns_to_insert.join(", "),
+            values = values.join(", "),
+            playlist_id = sql_quote(&playlist_id),
+        ));
+    }
+
+    sql.push_str(&format!(
+        "SELECT COUNT(*) FROM djmdPlaylist WHERE ID = {};\n",
+        sql_quote(&playlist_id)
+    ));
+    sql.push_str("COMMIT;\n");
+
+    let inserted_count = sqlcipher_lines(db_path, key, &sql)?
+        .last()
+        .cloned()
+        .unwrap_or_default();
+    if inserted_count != "1" {
+        return Err("could not create review playlist".to_string());
+    }
+
+    Ok(Some(playlist_name))
 }
 
 fn migrate_tracks_in_db(
@@ -4120,7 +4430,7 @@ where
     let png_encoder_available = ffmpeg_has_encoder("png").unwrap_or(false);
     let mut warnings = Vec::new();
     if let Some(backup_parent) = db_path.parent() {
-        match conversion_session::recover_stale_conversion_backups(backup_parent) {
+        match conversion_session::recover_stale_conversion_backups(backup_parent, &db_path) {
             Ok(report) => {
                 warnings.extend(report.warnings);
                 warnings.extend(report.errors);
@@ -4137,19 +4447,36 @@ where
                 error
             )),
         }
+        match conversion_session::cleanup_successful_music_backups(backup_parent) {
+            Ok(report) => warnings.extend(report.warnings),
+            Err(error) => warnings.push(format!(
+                "failed to clean successful music backups before starting: {}",
+                error
+            )),
+        }
+        match conversion_session::cleanup_successful_database_backups(backup_parent, 1) {
+            Ok(report) => warnings.extend(report.warnings),
+            Err(error) => warnings.push(format!(
+                "failed to clean old database backups before starting: {}",
+                error
+            )),
+        }
     }
 
     let timestamp = timestamp_token();
     let backup_root = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!("rkb-lossless-backup-{timestamp}"));
+        .join(format!(
+            "{}{timestamp}",
+            conversion_session::BACKUP_DIR_PREFIX
+        ));
     create_dir_all_path(&backup_root)?;
 
     let db_backup = backup_root.join("master.db");
     copy_path(&db_path, &db_backup)?;
 
-    let music_backup_root = backup_root.join("music");
+    let music_backup_root = conversion_session::music_backup_path(&backup_root);
     let mut session = conversion_session::ConversionSession::new();
     let mut skipped_embedded_artwork_count = 0usize;
     let total_tracks = req.tracks.len();
@@ -4213,6 +4540,20 @@ where
                 return Err(append_rollback_errors(error, rollback_errors));
             }
         };
+    let verification_playlist_name = match create_conversion_review_playlist(
+        &db_path,
+        DEFAULT_KEY,
+        &migrated_tracks,
+    ) {
+        Ok(name) => name,
+        Err(error) => {
+            warnings.push(format!(
+                    "Converted files and database changes were saved, but the review playlist could not be created automatically: {}",
+                    error
+                ));
+            None
+        }
+    };
 
     if let Err(error) = conversion_session::mark_manifest_completed(&backup_root) {
         warnings.push(format!(
@@ -4224,6 +4565,15 @@ where
         if !backup_root.join("manifest.completed").exists() {
             warnings.push(format!(
                 "Converted files and database changes were saved, but the interrupted-conversion manifest could not be removed automatically: {}",
+                error
+            ));
+        }
+    }
+    if backup_root.join("manifest.completed").exists() {
+        if let Err(error) = conversion_session::cleanup_successful_music_backup(&backup_root) {
+            warnings.push(format!(
+                "Converted files and database changes were saved, but the temporary music backup could not be removed automatically from {}: {}",
+                backup_root.display(),
                 error
             ));
         }
@@ -4263,12 +4613,32 @@ where
             }
         }
     }
+    if let Err(error) = conversion_session::write_conversion_receipts(
+        &backup_root,
+        &session,
+        verification_playlist_name.as_deref(),
+    ) {
+        warnings.push(format!(
+            "Converted files and database changes were saved, but the conversion summary could not be written automatically: {}",
+            error
+        ));
+    }
+    if let Some(backup_parent) = db_path.parent() {
+        match conversion_session::cleanup_successful_database_backups(backup_parent, 1) {
+            Ok(report) => warnings.extend(report.warnings),
+            Err(error) => warnings.push(format!(
+                "Converted files and database changes were saved, but old database backups could not be cleaned automatically: {}",
+                error
+            )),
+        }
+    }
 
     let response = ConvertResponse {
         backup_dir: backup_root.to_string_lossy().to_string(),
         converted_count: migrated_tracks.len(),
         analysis_migrated_count,
         analysis_missing_count,
+        verification_playlist_name,
         source_cleanup_mode: source_handling_name(source_handling).to_string(),
         source_cleanup_failures,
         cleanup_archived_dirs: cleanup_report.archived_dirs,
@@ -4793,6 +5163,42 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
     }
 
     #[test]
+    fn normalizes_rekordbox_file_url_paths() {
+        assert_eq!(
+            normalize_rekordbox_path_value("file://localhost/Users/me/Music/My%20Track.flac"),
+            "/Users/me/Music/My Track.flac"
+        );
+    }
+
+    #[test]
+    fn resolves_rekordbox_folder_path_with_file_name() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("My Track.flac");
+        fs::write(&source, b"fixture").expect("source fixture should be written");
+
+        assert_eq!(
+            resolve_rekordbox_audio_path(&dir.path().to_string_lossy(), "My Track.flac", ""),
+            source.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn derives_bitrate_from_duration_and_file_size_when_ffmpeg_reports_na() {
+        let mut probe = parse_ffmpeg_audio_probe(
+            "Input #0, flac, from 'song.flac':\n  Duration: 00:03:00.00, start: 0.000000, bitrate: N/A\n  Stream #0:0: Audio: flac, 44100 Hz, stereo, s24",
+        );
+
+        assert_eq!(probe.sample_rate, Some(44_100));
+        assert_eq!(probe.channels, Some(2));
+        assert_eq!(probe.bitrate_kbps, None);
+        assert_eq!(probe.duration_seconds, Some(180.0));
+
+        fill_audio_probe_bitrate_from_file_size(&mut probe, 45_000_000);
+
+        assert_eq!(probe.bitrate_kbps, Some(2000));
+    }
+
+    #[test]
     fn lossless_scan_bitrate_ignores_zero_database_value() {
         let row = ScanRow {
             id: "1".to_string(),
@@ -4803,6 +5209,8 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
             sample_rate: None,
             bitrate: Some(0),
             full_path: String::new(),
+            file_name_l: String::new(),
+            file_name_s: String::new(),
         };
 
         assert_eq!(lossless_scan_bitrate(&row), None);
@@ -4819,6 +5227,8 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
             sample_rate: None,
             bitrate: Some(2847),
             full_path: String::new(),
+            file_name_l: String::new(),
+            file_name_s: String::new(),
         };
 
         assert_eq!(lossless_scan_bitrate(&row), Some(2847));
@@ -5057,6 +5467,49 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
     }
 
     #[test]
+    fn validates_analysis_resources_with_stale_rekordbox_hash_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("ANLZ0000.DAT");
+        fs::write(&source, b"rewritten by rekordbox").expect("analysis fixture should be written");
+
+        let files = vec![ContentFileRef {
+            id: "analysis-id".to_string(),
+            path: "/PIONEER/USBANLZ/abc/track/ANLZ0000.DAT".to_string(),
+            rb_local_path: Some(source.to_string_lossy().to_string()),
+            uuid: Some("track-uuid".to_string()),
+            hash: Some("83863ccc7c42ba11314119165c5db124".to_string()),
+            size: Some(7580),
+        }];
+
+        let validated =
+            validate_analysis_resources(&files).expect("stale metadata should not block migration");
+
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0].source, source);
+    }
+
+    #[test]
+    fn rejects_empty_analysis_resource_hash_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("ANLZ0000.DAT");
+        fs::write(&source, b"analysis").expect("analysis fixture should be written");
+
+        let files = vec![ContentFileRef {
+            id: "analysis-id".to_string(),
+            path: "/PIONEER/USBANLZ/abc/track/ANLZ0000.DAT".to_string(),
+            rb_local_path: Some(source.to_string_lossy().to_string()),
+            uuid: Some("track-uuid".to_string()),
+            hash: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            size: Some(8),
+        }];
+
+        let error = validate_analysis_resources(&files)
+            .expect_err("empty hash metadata should still be rejected");
+
+        assert!(error.contains("analysis resource hash is empty"));
+    }
+
+    #[test]
     fn audio_probe_cache_signature_changes_when_file_is_rewritten() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let source = dir.path().join("track.wav");
@@ -5090,42 +5543,54 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
 
     #[test]
     fn refreshes_command_discovery_caches() {
+        let command_key = "__rkb_cache_test_command__";
+        let encoder_key = "__rkb_cache_test_encoder__";
         COMMAND_CACHE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("command cache lock poisoned")
-            .insert("ffmpeg".to_string(), false);
+            .insert(command_key.to_string(), false);
         COMMAND_PATH_CACHE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("command path cache lock poisoned")
-            .insert("ffmpeg".to_string(), None);
+            .insert(command_key.to_string(), None);
         ENCODER_CACHE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("encoder cache lock poisoned")
-            .insert("aac_at".to_string(), false);
+            .insert(encoder_key.to_string(), false);
 
         refresh_command_discovery_caches();
 
-        assert!(COMMAND_CACHE
+        assert!(!COMMAND_CACHE
             .get()
             .expect("command cache should exist")
             .lock()
             .expect("command cache lock poisoned")
-            .is_empty());
-        assert!(COMMAND_PATH_CACHE
+            .contains_key(command_key));
+        assert!(!COMMAND_PATH_CACHE
             .get()
             .expect("command path cache should exist")
             .lock()
             .expect("command path cache lock poisoned")
-            .is_empty());
-        assert!(ENCODER_CACHE
+            .contains_key(command_key));
+        assert!(!ENCODER_CACHE
             .get()
             .expect("encoder cache should exist")
             .lock()
             .expect("encoder cache lock poisoned")
-            .is_empty());
+            .contains_key(encoder_key));
+    }
+
+    #[test]
+    fn timestamp_tokens_are_unique_for_rapid_calls() {
+        let first = timestamp_token();
+        let second = timestamp_token();
+
+        assert_ne!(first, second);
+        assert!(first.contains('-'));
+        assert!(second.contains('-'));
     }
 
     #[test]

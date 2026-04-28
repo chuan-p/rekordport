@@ -1,9 +1,17 @@
 use super::*;
 
 fn process_output_contains(output: &[u8], needle: &str) -> bool {
-    String::from_utf8_lossy(output)
-        .to_ascii_lowercase()
-        .contains(&needle.to_ascii_lowercase())
+    String::from_utf8_lossy(output).lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case(needle) {
+            return true;
+        }
+
+        Path::new(trimmed)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(needle))
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -37,11 +45,19 @@ mod tests {
     #[test]
     fn detects_process_name_case_insensitively() {
         assert!(process_output_contains(
-            b"/Applications/rekordbox.app",
+            b"/Applications/rekordbox.app/Contents/MacOS/rekordbox",
             "Rekordbox"
         ));
         assert!(!process_output_contains(
             b"/Applications/Other.app",
+            "rekordbox"
+        ));
+        assert!(!process_output_contains(
+            b"/Users/chuanpeng/Documents/rkb-lossless-process/target/debug/rekordport",
+            "rekordbox"
+        ));
+        assert!(!process_output_contains(
+            b"/Applications/rekordboxAgent.app/Contents/MacOS/rekordboxAgent",
             "rekordbox"
         ));
     }

@@ -217,6 +217,7 @@ html.platform-macos .shell {
 
 .profile-card-role,
 .profile-card-version,
+.profile-card-backup,
 .profile-card-year {
   margin: 8px 0 0;
   line-height: 1.55;
@@ -238,6 +239,11 @@ html.platform-macos .shell {
 }
 
 .profile-card-version {
+  color: rgba(242, 243, 245, 0.72);
+  font-size: 0.82rem;
+}
+
+.profile-card-backup {
   color: rgba(242, 243, 245, 0.72);
   font-size: 0.82rem;
 }
@@ -999,6 +1005,23 @@ audio {
   align-self: center;
   grid-column: 1 / -1;
   font-size: 0.84rem;
+}
+
+.footer-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  line-height: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.footer-link:hover {
+  color: var(--accent);
 }
 
 .footer-meta {

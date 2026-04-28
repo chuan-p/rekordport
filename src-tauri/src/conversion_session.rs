@@ -4,6 +4,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 const COMPLETED_MARKER_NAME: &str = "manifest.completed";
+const DATABASE_BACKUP_NAME: &str = "master.db";
+pub(super) const BACKUP_DIR_PREFIX: &str = "rekordport-backup-";
+const LEGACY_BACKUP_DIR_PREFIX: &str = "rkb-lossless-backup-";
 
 #[derive(Debug)]
 pub(super) struct ConvertedArtifact {
@@ -30,6 +33,13 @@ pub(super) struct ConversionManifestEntry {
 pub(super) struct ConversionRecoveryReport {
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+}
+
+struct ConversionSummaryTrack {
+    title: String,
+    artist: String,
+    source_path: String,
+    output_path: String,
 }
 
 impl ConversionSession {
@@ -61,6 +71,18 @@ impl ConversionSession {
 
     pub(super) fn archive_paths(&self) -> impl Iterator<Item = &PathBuf> {
         self.artifacts.iter().map(|artifact| &artifact.archive_path)
+    }
+
+    fn summary_tracks(&self) -> Vec<ConversionSummaryTrack> {
+        self.artifacts
+            .iter()
+            .map(|artifact| ConversionSummaryTrack {
+                title: artifact.converted_track.title.clone(),
+                artist: artifact.converted_track.artist.clone(),
+                source_path: artifact.source_path.to_string_lossy().to_string(),
+                output_path: artifact.output_path.to_string_lossy().to_string(),
+            })
+            .collect()
     }
 
     pub(super) fn remove_outputs(&self) -> Vec<String> {
@@ -99,12 +121,70 @@ impl ConversionSession {
     }
 }
 
+fn receipt_created_at() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn display_track_name(track: &ConversionSummaryTrack) -> String {
+    match (
+        track.artist.trim().is_empty(),
+        track.title.trim().is_empty(),
+    ) {
+        (false, false) => format!("{} - {}", track.artist.trim(), track.title.trim()),
+        (true, false) => track.title.trim().to_string(),
+        (false, true) => track.artist.trim().to_string(),
+        (true, true) => track.source_path.clone(),
+    }
+}
+
+pub(super) fn write_conversion_receipts(
+    backup_root: &Path,
+    session: &ConversionSession,
+    playlist_name: Option<&str>,
+) -> Result<(), String> {
+    let tracks = session.summary_tracks();
+    let created_at = receipt_created_at();
+    let mut summary = String::new();
+    summary.push_str("rekordport conversion summary\n");
+    summary.push_str(&format!("Created: {created_at}\n"));
+    summary.push_str(&format!("Converted: {} track(s)\n", tracks.len()));
+    if let Some(name) = playlist_name {
+        summary.push_str(&format!("Review playlist: {name}\n"));
+    }
+    summary.push_str(&format!("Backup: {}\n", backup_root.display()));
+    summary.push('\n');
+    summary.push_str("Tracks:\n");
+    for track in &tracks {
+        summary.push_str(&format!("- {}\n", display_track_name(track)));
+        summary.push_str(&format!("  From: {}\n", track.source_path));
+        summary.push_str(&format!("  To:   {}\n", track.output_path));
+    }
+    write_path(&backup_root.join("conversion-summary.txt"), summary)?;
+    Ok(())
+}
+
 fn manifest_path(backup_root: &Path) -> PathBuf {
     backup_root.join("manifest.jsonl")
 }
 
 fn completed_marker_path(backup_root: &Path) -> PathBuf {
     backup_root.join(COMPLETED_MARKER_NAME)
+}
+
+fn database_backup_path(backup_root: &Path) -> PathBuf {
+    backup_root.join(DATABASE_BACKUP_NAME)
+}
+
+pub(super) fn music_backup_path(backup_root: &Path) -> PathBuf {
+    backup_root.join("music")
+}
+
+fn is_conversion_backup_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(BACKUP_DIR_PREFIX) || name.starts_with(LEGACY_BACKUP_DIR_PREFIX)
+        })
 }
 
 pub(super) fn append_manifest_entry(
@@ -183,11 +263,7 @@ pub(super) fn stale_conversion_backup_manifests(
         if !path.is_dir() {
             continue;
         }
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("rkb-lossless-backup-"))
-        {
+        if !is_conversion_backup_dir(&path) {
             continue;
         }
         if path_exists(&completed_marker_path(&path))? {
@@ -261,10 +337,32 @@ fn recover_manifest_entry(entry: &ConversionManifestEntry) -> ConversionRecovery
 
 pub(super) fn recover_stale_conversion_backups(
     backup_parent: &Path,
+    db_path: &Path,
 ) -> Result<ConversionRecoveryReport, String> {
     let mut report = ConversionRecoveryReport::default();
     for manifest in stale_conversion_backup_manifests(backup_parent)? {
         let manifest_dir = manifest.parent().unwrap_or(backup_parent);
+        let db_backup = database_backup_path(manifest_dir);
+        if path_exists(&db_backup).unwrap_or(false) {
+            if let Err(error) = copy_path(&db_backup, db_path) {
+                report.errors.push(format!(
+                    "failed to restore database backup {} -> {} before recovering interrupted conversion {}: {}",
+                    db_backup.display(),
+                    db_path.display(),
+                    manifest.display(),
+                    error
+                ));
+                continue;
+            }
+        } else {
+            report.errors.push(format!(
+                "missing database backup {} while recovering interrupted conversion {}",
+                db_backup.display(),
+                manifest.display()
+            ));
+            continue;
+        }
+
         let manifest_text = String::from_utf8_lossy(&read_path(&manifest)?).to_string();
         let mut had_parse_error = false;
         let mut manifest_report = ConversionRecoveryReport::default();
@@ -331,11 +429,7 @@ pub(super) fn cleanup_completed_conversion_backups(
         if !path.is_dir() {
             continue;
         }
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("rkb-lossless-backup-"))
-        {
+        if !is_conversion_backup_dir(&path) {
             continue;
         }
 
@@ -364,6 +458,113 @@ pub(super) fn cleanup_completed_conversion_backups(
                     error
                 ));
             }
+        }
+    }
+
+    Ok(report)
+}
+
+pub(super) fn cleanup_successful_music_backup(backup_root: &Path) -> Result<(), String> {
+    let music_backup = music_backup_path(backup_root);
+    if !path_exists(&music_backup)? {
+        return Ok(());
+    }
+    remove_dir_all_path(&music_backup)
+}
+
+pub(super) fn cleanup_successful_music_backups(
+    backup_parent: &Path,
+) -> Result<ConversionRecoveryReport, String> {
+    let mut report = ConversionRecoveryReport::default();
+    if !path_exists(backup_parent)? {
+        return Ok(report);
+    }
+
+    for entry in read_dir_path(backup_parent)? {
+        let entry = entry.map_err(|error| {
+            io_error_message(
+                &format!(
+                    "failed to read backup directory entry in {}",
+                    backup_parent.display()
+                ),
+                &error,
+            )
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !is_conversion_backup_dir(&path) {
+            continue;
+        }
+        if is_incomplete_conversion_backup(&path)? {
+            continue;
+        }
+        if let Err(error) = cleanup_successful_music_backup(&path) {
+            report.warnings.push(format!(
+                "failed to remove successful music backup {}: {}",
+                music_backup_path(&path).display(),
+                error
+            ));
+        }
+    }
+
+    Ok(report)
+}
+
+fn is_incomplete_conversion_backup(backup_root: &Path) -> Result<bool, String> {
+    Ok(path_exists(&manifest_path(backup_root))?
+        && !path_exists(&completed_marker_path(backup_root))?)
+}
+
+pub(super) fn cleanup_successful_database_backups(
+    backup_parent: &Path,
+    retain_count: usize,
+) -> Result<ConversionRecoveryReport, String> {
+    let mut report = ConversionRecoveryReport::default();
+    if !path_exists(backup_parent)? {
+        return Ok(report);
+    }
+
+    let mut successful_backups = Vec::new();
+    for entry in read_dir_path(backup_parent)? {
+        let entry = entry.map_err(|error| {
+            io_error_message(
+                &format!(
+                    "failed to read backup directory entry in {}",
+                    backup_parent.display()
+                ),
+                &error,
+            )
+        })?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with(BACKUP_DIR_PREFIX) || name.starts_with(LEGACY_BACKUP_DIR_PREFIX)) {
+            continue;
+        }
+        if is_incomplete_conversion_backup(&path)? {
+            continue;
+        }
+        if !path_exists(&database_backup_path(&path))? {
+            continue;
+        }
+        successful_backups.push((name.to_string(), path));
+    }
+
+    successful_backups.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, backup_root) in successful_backups.into_iter().skip(retain_count) {
+        let db_backup = database_backup_path(&backup_root);
+        if let Err(error) = remove_file_path(&db_backup) {
+            report.warnings.push(format!(
+                "failed to remove older database backup {}: {}",
+                db_backup.display(),
+                error
+            ));
         }
     }
 
@@ -457,15 +658,105 @@ mod tests {
     }
 
     #[test]
+    fn write_conversion_receipts_creates_conversion_summary() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let source = dir.path().join("track.flac");
+        let archive = dir.path().join("track-1000kbps.flac");
+        let output = dir.path().join("track.wav");
+
+        fs::create_dir_all(&backup_root).expect("backup root should be created");
+
+        let track = Track {
+            id: "1".to_string(),
+            source_id: None,
+            scan_issue: None,
+            scan_note: None,
+            analysis_state: None,
+            analysis_note: None,
+            title: "Track".to_string(),
+            artist: "Artist".to_string(),
+            file_type: "FLAC".to_string(),
+            codec_name: None,
+            bit_depth: Some(24),
+            sample_rate: Some(48_000),
+            bitrate: Some(1000),
+            full_path: source.to_string_lossy().to_string(),
+        };
+        let mut converted = track.clone();
+        converted.full_path = output.to_string_lossy().to_string();
+
+        let mut session = ConversionSession::new();
+        session.push(&track, converted, output, archive);
+        write_conversion_receipts(
+            &backup_root,
+            &session,
+            Some("rekordport Converted 04-28 15:42"),
+        )
+        .expect("summary should be written");
+
+        let summary = fs::read_to_string(backup_root.join("conversion-summary.txt"))
+            .expect("summary should be readable");
+        assert!(summary.contains("Converted: 1 track(s)"));
+        assert!(summary.contains("Artist - Track"));
+        assert!(summary.contains("rekordport Converted 04-28 15:42"));
+    }
+
+    #[test]
+    fn write_conversion_receipts_does_not_create_restore_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let source = dir.path().join("track.flac");
+        let archive = dir.path().join("track-1000kbps.flac");
+        let output = dir.path().join("track.wav");
+
+        fs::create_dir_all(&backup_root).expect("backup root should be created");
+
+        let track = Track {
+            id: "1".to_string(),
+            source_id: None,
+            scan_issue: None,
+            scan_note: None,
+            analysis_state: None,
+            analysis_note: None,
+            title: "Track".to_string(),
+            artist: "Artist".to_string(),
+            file_type: "FLAC".to_string(),
+            codec_name: None,
+            bit_depth: Some(24),
+            sample_rate: Some(48_000),
+            bitrate: Some(1000),
+            full_path: source.to_string_lossy().to_string(),
+        };
+        let mut converted = track.clone();
+        converted.full_path = output.to_string_lossy().to_string();
+
+        let mut session = ConversionSession::new();
+        session.push(&track, converted, output, archive);
+        write_conversion_receipts(&backup_root, &session, None).expect("summary should be written");
+
+        let summary = fs::read_to_string(backup_root.join("conversion-summary.txt"))
+            .expect("summary should be readable");
+        assert!(!summary.contains("Restore:"));
+        assert!(!backup_root.join("restore-plan.json").exists());
+        assert!(!backup_root.join("Restore this conversion.command").exists());
+        assert!(!backup_root.join("Restore this conversion.ps1").exists());
+    }
+
+    #[test]
     fn recover_stale_conversion_backups_restores_files_and_clears_manifest() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
-        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let db_path = dir.path().join("master.db");
         let source = dir.path().join("track.flac");
         let archive = backup_root.join("music/track-1000kbps.flac");
         let output = dir.path().join("track.wav");
 
         fs::create_dir_all(archive.parent().expect("archive parent should exist"))
             .expect("backup directories should be created");
+        fs::write(&db_path, b"converted database").expect("database fixture should be written");
+        fs::write(database_backup_path(&backup_root), b"original database")
+            .expect("database backup fixture should be written");
         fs::write(&archive, b"archived audio").expect("archive fixture should be written");
         fs::write(&output, b"converted audio").expect("output fixture should be written");
 
@@ -477,7 +768,7 @@ mod tests {
         };
         append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
 
-        let report = recover_stale_conversion_backups(dir.path())
+        let report = recover_stale_conversion_backups(dir.path(), &db_path)
             .expect("stale conversion backup should be recoverable");
 
         assert!(report.errors.is_empty());
@@ -489,18 +780,26 @@ mod tests {
             fs::read(&source).expect("source should be restored"),
             b"archived audio"
         );
+        assert_eq!(
+            fs::read(&db_path).expect("database should be restored"),
+            b"original database"
+        );
     }
 
     #[test]
     fn recover_stale_conversion_backups_removes_duplicate_archive_when_source_is_present() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
-        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let db_path = dir.path().join("master.db");
         let source = dir.path().join("track.flac");
         let archive = backup_root.join("music/track-1000kbps.flac");
         let output = dir.path().join("track.wav");
 
         fs::create_dir_all(archive.parent().expect("archive parent should exist"))
             .expect("backup directories should be created");
+        fs::write(&db_path, b"converted database").expect("database fixture should be written");
+        fs::write(database_backup_path(&backup_root), b"original database")
+            .expect("database backup fixture should be written");
         fs::write(&source, b"original audio").expect("source fixture should be written");
         fs::write(&archive, b"duplicate archived audio")
             .expect("archive fixture should be written");
@@ -514,7 +813,7 @@ mod tests {
         };
         append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
 
-        let report = recover_stale_conversion_backups(dir.path())
+        let report = recover_stale_conversion_backups(dir.path(), &db_path)
             .expect("stale conversion backup should be recoverable");
 
         assert!(report.errors.is_empty());
@@ -526,12 +825,16 @@ mod tests {
     #[test]
     fn recover_stale_conversion_backups_keeps_archive_when_output_removal_fails() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
-        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let db_path = dir.path().join("master.db");
         let source = dir.path().join("track.wav");
         let archive = backup_root.join("music/track-1536kbps.wav");
 
         fs::create_dir_all(archive.parent().expect("archive parent should exist"))
             .expect("backup directories should be created");
+        fs::write(&db_path, b"converted database").expect("database fixture should be written");
+        fs::write(database_backup_path(&backup_root), b"original database")
+            .expect("database backup fixture should be written");
         fs::create_dir_all(&source).expect("source directory should be created");
         fs::write(&archive, b"archived audio").expect("archive fixture should be written");
 
@@ -543,7 +846,7 @@ mod tests {
         };
         append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
 
-        let report = recover_stale_conversion_backups(dir.path())
+        let report = recover_stale_conversion_backups(dir.path(), &db_path)
             .expect("stale conversion backup should be recoverable");
 
         assert!(!report.errors.is_empty());
@@ -553,9 +856,43 @@ mod tests {
     }
 
     #[test]
+    fn recover_stale_conversion_backups_keeps_manifest_when_database_restore_fails() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let db_path = dir.path().join("master.db");
+        let source = dir.path().join("track.flac");
+        let archive = backup_root.join("music/track-1000kbps.flac");
+        let output = dir.path().join("track.wav");
+
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("backup directories should be created");
+        fs::create_dir_all(&db_path).expect("database restore target should be blocked");
+        fs::write(database_backup_path(&backup_root), b"original database")
+            .expect("database backup fixture should be written");
+        fs::write(&archive, b"archived audio").expect("archive fixture should be written");
+        fs::write(&output, b"converted audio").expect("output fixture should be written");
+
+        let entry = ConversionManifestEntry {
+            track_id: "1".to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            output_path: output.to_string_lossy().to_string(),
+        };
+        append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
+
+        let report = recover_stale_conversion_backups(dir.path(), &db_path)
+            .expect("stale conversion recovery should report restore errors");
+
+        assert!(!report.errors.is_empty());
+        assert!(archive.exists());
+        assert!(output.exists());
+        assert!(backup_root.join("manifest.jsonl").exists());
+    }
+
+    #[test]
     fn cleanup_completed_conversion_backups_removes_completed_manifest_files() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
-        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let backup_root = dir.path().join("rekordport-backup-123");
         let manifest = manifest_path(&backup_root);
         let marker = completed_marker_path(&backup_root);
 
@@ -574,7 +911,7 @@ mod tests {
     #[test]
     fn cleanup_completed_conversion_backups_keeps_marker_when_manifest_removal_fails() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
-        let backup_root = dir.path().join("rkb-lossless-backup-123");
+        let backup_root = dir.path().join("rekordport-backup-123");
         let manifest = manifest_path(&backup_root);
         let marker = completed_marker_path(&backup_root);
 
@@ -588,5 +925,114 @@ mod tests {
         assert!(!report.warnings.is_empty());
         assert!(manifest.exists());
         assert!(marker.exists());
+    }
+
+    #[test]
+    fn cleanup_successful_music_backup_removes_music_directory() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let music_file = music_backup_path(&backup_root).join("library/track.flac");
+
+        fs::create_dir_all(music_file.parent().expect("music parent should exist"))
+            .expect("music backup directories should be created");
+        fs::write(&music_file, b"source audio").expect("music backup should be written");
+        fs::write(database_backup_path(&backup_root), b"database")
+            .expect("database backup should be written");
+
+        cleanup_successful_music_backup(&backup_root)
+            .expect("successful music backup cleanup should succeed");
+
+        assert!(!music_backup_path(&backup_root).exists());
+        assert!(database_backup_path(&backup_root).exists());
+    }
+
+    #[test]
+    fn cleanup_successful_music_backup_reports_removal_failure() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let music_backup = music_backup_path(&backup_root);
+
+        fs::create_dir_all(&backup_root).expect("backup root should be created");
+        fs::write(&music_backup, b"not a directory").expect("blocked music path should be written");
+
+        let error = cleanup_successful_music_backup(&backup_root)
+            .expect_err("file at music path should block directory cleanup");
+
+        assert!(error.contains("failed to remove directory"));
+        assert!(music_backup.exists());
+    }
+
+    #[test]
+    fn cleanup_successful_music_backups_skips_incomplete_backups() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let successful_backup = dir.path().join("rekordport-backup-100");
+        let incomplete_backup = dir.path().join("rekordport-backup-200");
+        let successful_music = music_backup_path(&successful_backup).join("track.flac");
+        let incomplete_music = music_backup_path(&incomplete_backup).join("track.flac");
+
+        fs::create_dir_all(
+            successful_music
+                .parent()
+                .expect("successful music parent should exist"),
+        )
+        .expect("successful music backup should be created");
+        fs::create_dir_all(
+            incomplete_music
+                .parent()
+                .expect("incomplete music parent should exist"),
+        )
+        .expect("incomplete music backup should be created");
+        fs::write(&successful_music, b"successful music")
+            .expect("successful music should be written");
+        fs::write(&incomplete_music, b"incomplete music")
+            .expect("incomplete music should be written");
+        fs::write(manifest_path(&incomplete_backup), b"pending")
+            .expect("incomplete manifest should be written");
+
+        let report = cleanup_successful_music_backups(dir.path())
+            .expect("successful music backup cleanup should succeed");
+
+        assert!(report.warnings.is_empty());
+        assert!(!music_backup_path(&successful_backup).exists());
+        assert!(incomplete_music.exists());
+    }
+
+    #[test]
+    fn cleanup_successful_database_backups_keeps_latest_and_incomplete_backups() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let old_backup = dir.path().join("rekordport-backup-100");
+        let latest_backup = dir.path().join("rekordport-backup-200");
+        let incomplete_backup = dir.path().join("rekordport-backup-300");
+        let old_music_file = music_backup_path(&old_backup).join("track.flac");
+
+        fs::create_dir_all(
+            old_music_file
+                .parent()
+                .expect("old music parent should exist"),
+        )
+        .expect("old music backup should be created");
+        fs::create_dir_all(&latest_backup).expect("latest backup should be created");
+        fs::create_dir_all(&incomplete_backup).expect("incomplete backup should be created");
+        fs::write(database_backup_path(&old_backup), b"old database")
+            .expect("old database backup should be written");
+        fs::write(database_backup_path(&latest_backup), b"latest database")
+            .expect("latest database backup should be written");
+        fs::write(
+            database_backup_path(&incomplete_backup),
+            b"incomplete database",
+        )
+        .expect("incomplete database backup should be written");
+        fs::write(manifest_path(&incomplete_backup), b"pending")
+            .expect("incomplete manifest should be written");
+        fs::write(&old_music_file, b"old music").expect("old music backup should be written");
+
+        let report = cleanup_successful_database_backups(dir.path(), 1)
+            .expect("database backup cleanup should succeed");
+
+        assert!(report.warnings.is_empty());
+        assert!(!database_backup_path(&old_backup).exists());
+        assert!(database_backup_path(&latest_backup).exists());
+        assert!(database_backup_path(&incomplete_backup).exists());
+        assert!(old_music_file.exists());
     }
 }

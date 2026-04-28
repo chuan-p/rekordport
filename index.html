@@ -8,6 +8,7 @@
       name="description"
       content="Scan Rekordbox master.db for FLAC and high-bit-depth WAV/AIFF tracks."
     />
+    <link rel="stylesheet" href="/src/style.css" />
     <script type="module" src="/src/main.js"></script>
   </head>
   <body>
@@ -103,7 +104,7 @@
           <div class="inline-field source-field">
             <label for="source-handling">Source Handling</label>
             <select id="source-handling">
-              <option value="rename">Rename and keep in folder</option>
+              <option value="rename">Keep renamed originals</option>
               <option value="trash">Move to Trash</option>
             </select>
           </div>
@@ -129,8 +130,8 @@
               aria-haspopup="dialog"
               aria-expanded="false"
               aria-controls="profile-card"
-              aria-label="About the developer"
-              title="About"
+              aria-label="Info"
+              title="Info"
             >
               i
             </button>
@@ -151,6 +152,7 @@
         <h3 id="profile-name"></h3>
         <p class="profile-card-role" id="profile-role"></p>
         <p class="profile-card-version" id="profile-version"></p>
+        <p class="profile-card-backup" id="profile-backup" hidden></p>
         <p class="profile-card-year" id="profile-year"></p>
       </div>
     </section>

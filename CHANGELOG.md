@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1 - 2026-04-28
+
+### Added
+
+- Added a Rekordbox review playlist for each successful conversion, containing the tracks converted in that run.
+- Added a backup link to the info card so the retained recovery backup can be opened directly after conversion.
+
+### Fixed
+
+- Fixed review playlists being hidden in Rekordbox by creating them as normal root playlists instead of inheriting deleted or special playlist state from an existing template.
+- Fixed false "Close rekordbox before converting" warnings on macOS by matching the Rekordbox executable name exactly instead of substring-matching process paths.
+- Improved FLAC/ALAC bitrate display when Rekordbox stores a zero bitrate by resolving Rekordbox file paths more robustly and deriving an average bitrate when ffmpeg reports `N/A`.
+
+### Improved
+
+- Shortened the conversion completion message and moved backup details out of the footer.
+- Clarified the info card label.
+- Renamed new conversion backup folders from `rkb-lossless-backup-*` to `rekordport-backup-*`, while keeping recovery and cleanup compatible with older backup folders.
+- After a successful conversion, full music backups are cleaned automatically while the latest recovery `master.db` backup is retained.
+
 ## 0.3.0 - 2026-04-27
 
 ### Added

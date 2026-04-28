@@ -17,6 +17,9 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 1420,
     strictPort: true,
+    headers: {
+      "Cache-Control": "no-store",
+    },
   },
   build: {
     outDir: "dist",
