@@ -80,7 +80,6 @@ const els = {
   exportProgress: $("export-progress"),
   exportProgressBar: $("export-progress-bar"),
   exportProgressText: $("export-progress-text"),
-  resultsCaption: $("results-caption"),
   resultsMeta: $("results-meta"),
   body: $("results-body"),
   footerCopy: $("footer-copy"),
@@ -984,7 +983,6 @@ function renderSummary() {
   const convertedCount = state.tracks.filter((track) => track.status === "converted").length;
   const selectedCount = state.selectedIds.size;
   const items = [
-    summary.candidate_total ? `Candidates ${formatNumber(summary.candidate_total)}` : null,
     `FLAC ${formatNumber(summary.flac)}`,
     `ALAC ${formatNumber(summary.alac)}`,
     `Hi-Res ${formatNumber(summary.hi_res)}`,
@@ -1019,12 +1017,6 @@ function renderResults() {
     : state.scanSummary
       ? "No results to display."
       : "Click “Scan Library” to begin.";
-  els.resultsCaption.textContent = state.loading && state.loadingTask === "scan"
-    ? state.scanProgress.message || "Scanning rekordbox library…"
-    : state.scanSummary?.candidate_total
-      ? `${formatNumber(tracks.length)} results from ${formatNumber(state.scanSummary.candidate_total)} candidate tracks`
-      : `${formatNumber(tracks.length)} results`;
-
   if (!tracks.length) {
     els.body.innerHTML = `
       <tr class="empty-row">
@@ -1204,7 +1196,7 @@ async function scan() {
     setStatus("Scanned", "", "ready");
     if (summary?.library_total) {
       const noteParts = [
-        `Scanned ${formatNumber(summary.candidate_total)} candidate tracks from ${formatNumber(summary.library_total)} library entries.`,
+        `Scanned ${formatNumber(summary.total)} results from ${formatNumber(summary.library_total)} library entries.`,
       ];
       if (summary.unreadable_m4a) {
         noteParts.push(

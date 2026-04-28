@@ -500,8 +500,7 @@ input[type="checkbox"] {
 
 .status-meta,
 .footer-copy,
-.footer-note,
-.panel-title p {
+.footer-note {
   color: var(--muted);
   line-height: 1.55;
 }
@@ -571,7 +570,7 @@ button:disabled {
 .results-title {
   position: relative;
   display: block;
-  min-height: 64px;
+  min-height: 32px;
   padding-right: min(52%, 640px);
 }
 

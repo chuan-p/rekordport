@@ -4725,14 +4725,7 @@ where
         phase: "done".to_string(),
         current: response.summary.total,
         total: response.summary.total,
-        message: if response.summary.total == 0 {
-            "Scan complete. No tracks need processing.".to_string()
-        } else {
-            format!(
-                "Scan complete. Found {} results from {} candidate tracks.",
-                response.summary.total, response.summary.candidate_total
-            )
-        },
+        message: String::new(),
     });
 
     Ok(response)
