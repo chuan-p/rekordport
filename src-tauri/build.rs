@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 fn expected_windows_sidecar_sha256(command: &str) -> Option<&'static str> {
     match command {
-        "ffmpeg" => Some("d2bcaee1792a39e2bfd2c04a3d88daf53d4e857a6583fed68c03562106f745bd"),
+        "ffmpeg" => Some("0c807b2a284a1b4c6c8f609ba90da7a4e623362313b18b2fe98d2cdb1535ea28"),
         "sqlcipher" => Some("19f16d2629adedc6ddc2aeebd2da165d61aa0d645a61d2de373396c04ad0031f"),
         _ => None,
     }

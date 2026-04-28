@@ -90,8 +90,8 @@ function shouldRequireTargetSidecars(env = process.env) {
 }
 
 const pinnedWindowsSidecarSha256 = new Map([
-  ["x86_64-pc-windows-msvc:ffmpeg", "d2bcaee1792a39e2bfd2c04a3d88daf53d4e857a6583fed68c03562106f745bd"],
-  ["aarch64-pc-windows-msvc:ffmpeg", "a29d83d01d3a07cfe060af439c803a082a508fd92c662a74d0ee946888ee4c1a"],
+  ["x86_64-pc-windows-msvc:ffmpeg", "0c807b2a284a1b4c6c8f609ba90da7a4e623362313b18b2fe98d2cdb1535ea28"],
+  ["aarch64-pc-windows-msvc:ffmpeg", "f0c5831e0a20eba2116df414ab1ad5139b0c34356eb93bb3c53b400c68823951"],
   ["x86_64-pc-windows-msvc:sqlcipher", "19f16d2629adedc6ddc2aeebd2da165d61aa0d645a61d2de373396c04ad0031f"],
 ]);
 
