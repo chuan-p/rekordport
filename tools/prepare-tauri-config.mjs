@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -88,14 +89,24 @@ function shouldRequireTargetSidecars(env = process.env) {
   return explicit ?? false;
 }
 
-function windowsFfmpegDefaultUrl(targetTriple) {
-  if (targetTriple === "x86_64-pc-windows-msvc") {
-    return "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-lgpl.zip";
+const pinnedWindowsSidecarSha256 = new Map([
+  ["x86_64-pc-windows-msvc:ffmpeg", "d2bcaee1792a39e2bfd2c04a3d88daf53d4e857a6583fed68c03562106f745bd"],
+  ["aarch64-pc-windows-msvc:ffmpeg", "a29d83d01d3a07cfe060af439c803a082a508fd92c662a74d0ee946888ee4c1a"],
+  ["x86_64-pc-windows-msvc:sqlcipher", "19f16d2629adedc6ddc2aeebd2da165d61aa0d645a61d2de373396c04ad0031f"],
+]);
+
+function verifyWindowsSidecarHash(command, targetTriple, filePath) {
+  if (!targetTriple.includes("windows")) return;
+  const expected = pinnedWindowsSidecarSha256.get(`${targetTriple}:${command}`);
+  if (!expected) {
+    throw new Error(`No pinned SHA-256 is configured for ${command} ${targetTriple}.`);
   }
-  if (targetTriple === "aarch64-pc-windows-msvc") {
-    return "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-winarm64-lgpl.zip";
+  const actual = createHash("sha256").update(readFileSync(filePath)).digest("hex");
+  if (actual !== expected) {
+    throw new Error(
+      `Refusing to stage ${path.relative(repoRoot, filePath)}: SHA-256 mismatch for ${command} ${targetTriple}. expected=${expected} actual=${actual}`
+    );
   }
-  return null;
 }
 
 function ensureWindowsSidecars(targetTriple) {
@@ -130,9 +141,6 @@ function ensureWindowsSidecars(targetTriple) {
           env: {
             ...process.env,
             RKB_WINDOWS_TARGET_TRIPLE: targetTriple,
-            ...(windowsFfmpegDefaultUrl(targetTriple)
-              ? { RKB_FFMPEG_WINDOWS_DEFAULT_URL: windowsFfmpegDefaultUrl(targetTriple) }
-              : {}),
           },
           stdio: "inherit",
         }
@@ -460,6 +468,7 @@ for (const entry of externalBins) {
     });
     dylibCount = staged.dylibCount;
   } else {
+    verifyWindowsSidecarHash(command, targetTriple, sourcePath);
     copyResolvedFile(sourcePath, stagedBinaryPath);
   }
 

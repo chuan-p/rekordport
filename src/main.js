@@ -23,6 +23,13 @@ const PROFILE = {
 
 const $ = (id) => document.getElementById(id);
 
+function makeOperationId(prefix) {
+  if (crypto?.randomUUID) {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 const state = {
   tracks: [],
   scanSummary: null,
@@ -34,6 +41,8 @@ const state = {
   preflight: null,
   preflightRequestId: 0,
   scanRequestId: 0,
+  scanOperationId: null,
+  convertOperationId: null,
   update: {
     status: "checking",
     latestVersion: null,
@@ -717,6 +726,11 @@ function nextPreviewRequest() {
   return state.player.requestSeq;
 }
 
+function previewRequestMatches(requestSeq, track) {
+  return requestSeq === state.player.requestSeq
+    && state.player.track?.id === track?.id;
+}
+
 async function attemptPreviewPlayback(requestSeq, { reportError = false } = {}) {
   try {
     await els.previewAudio.play();
@@ -784,7 +798,13 @@ async function loadPreviewTrack(track, autoplay = true) {
   let playablePath;
   try {
     playablePath = await resolvePreviewPath(track.full_path);
+    if (!previewRequestMatches(requestSeq, track)) {
+      return;
+    }
   } catch (error) {
+    if (!previewRequestMatches(requestSeq, track)) {
+      return;
+    }
     Object.assign(state.player, previousPlayerState);
     renderPlayer();
     renderResults();
@@ -793,6 +813,9 @@ async function loadPreviewTrack(track, autoplay = true) {
     return;
   }
 
+  if (!previewRequestMatches(requestSeq, track)) {
+    return;
+  }
   const src = convertFileSrc(normalizePreviewAssetPath(playablePath));
   els.previewAudio.src = src;
   els.previewAudio.load();
@@ -909,6 +932,7 @@ function currentScanRequestMatches(requestId, requestedPath, ignoreSamplerChecke
 
 async function invalidateScanState({ clearPreflight = false } = {}) {
   state.scanRequestId += 1;
+  state.scanOperationId = null;
   state.tracks = [];
   state.scanSummary = null;
   state.selectedIds = new Set();
@@ -1156,9 +1180,11 @@ async function pickDatabase() {
 
 async function scan() {
   const requestId = state.scanRequestId + 1;
+  const operationId = makeOperationId("scan");
   const requestedPath = els.dbPath.value;
   const ignoreSamplerChecked = els.includeSampler.checked;
   state.scanRequestId = requestId;
+  state.scanOperationId = operationId;
   setError("");
   clearConversionMessage();
   setLoading(true, "scan");
@@ -1175,6 +1201,7 @@ async function scan() {
         dbPath: requestedPath,
         minBitDepth: DEFAULT_MIN_BIT_DEPTH,
         includeSampler: !ignoreSamplerChecked,
+        operationId,
       },
     });
     if (!currentScanRequestMatches(requestId, requestedPath, ignoreSamplerChecked)) {
@@ -1232,7 +1259,10 @@ async function scan() {
     setStatus("Error", "", "error");
     setError(String(error));
   } finally {
-    setLoading(false);
+    if (state.scanOperationId === operationId) {
+      state.scanOperationId = null;
+      setLoading(false);
+    }
   }
 }
 
@@ -1263,6 +1293,8 @@ async function convertSelected(conflictResolution = "error") {
   setError("");
   clearConversionMessage();
   setLoading(true, "convert");
+  const operationId = makeOperationId("convert");
+  state.convertOperationId = operationId;
   const previousPreview = await releasePreviewAudio();
   setConvertProgress({
     active: true,
@@ -1279,6 +1311,7 @@ async function convertSelected(conflictResolution = "error") {
         sourceHandling,
         archiveConflictResolution: conflictResolution,
         outputConflictResolution: conflictResolution,
+        operationId,
         tracks,
       },
     });
@@ -1334,6 +1367,9 @@ async function convertSelected(conflictResolution = "error") {
       const nextResolution = promptConflictResolution(conflict);
       if (nextResolution) {
         setLoading(false);
+        if (state.convertOperationId === operationId) {
+          state.convertOperationId = null;
+        }
         setConvertProgress({
           active: false,
           phase: "idle",
@@ -1348,13 +1384,19 @@ async function convertSelected(conflictResolution = "error") {
     setStatus("Error", "", "error");
     setError(String(error));
   } finally {
-    setLoading(false);
+    if (state.convertOperationId === operationId) {
+      state.convertOperationId = null;
+      setLoading(false);
+    }
   }
 }
 
 async function wireEvents() {
   await listen("scan-progress", (event) => {
     const payload = event.payload || {};
+    if (!payload.operationId || payload.operationId !== state.scanOperationId) {
+      return;
+    }
     setScanProgress({
       active: payload.phase !== "done" && payload.phase !== "error",
       phase: payload.phase || "processing",
@@ -1369,6 +1411,9 @@ async function wireEvents() {
 
   await listen("convert-progress", (event) => {
     const payload = event.payload || {};
+    if (!payload.operationId || payload.operationId !== state.convertOperationId) {
+      return;
+    }
     setConvertProgress({
       active: payload.phase !== "done" && payload.phase !== "error",
       phase: payload.phase || "processing",

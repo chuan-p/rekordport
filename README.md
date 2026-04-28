@@ -25,7 +25,7 @@ rekordport is a tool for scanning a rekordbox library, finding hi-res files CDJs
   - WAV / AIFF above 16-bit or above 48kHz
 - Lets you preview results in a desktop UI
 - Converts selected tracks to `WAV`, `AIFF`, `MP3 320kbps`, or `M4A 320kbps`
-- Backs up the source file and database before conversion
+- Backs up the source file and database before conversion and keeps recovery data until rollback is safe
 - Rewrites rekordbox paths and rebinds standard playlists to the new entry
 
 
@@ -33,10 +33,12 @@ rekordport is a tool for scanning a rekordbox library, finding hi-res files CDJs
 
 - `rekordport` modifies your rekordbox database during conversion.
 - The app creates backups first, but you should still keep your own library backup.
+- After a successful conversion, the latest database backup is retained. Temporary full music backups are removed after success; renamed source files are either kept next to the converted file or moved to Trash, depending on the selected source handling mode.
 - Smart playlists are not rewritten yet.
 - `MP3` and `M4A` now preserve embedded cover art when the source contains attached artwork.
 - `AIFF` attempts to preserve embedded artwork on a best-effort basis.
 - `WAV` output does not preserve embedded cover art.
+- The app checks GitHub Releases for updates on startup. On Windows, it may also download Microsoft's WebView2 Evergreen Bootstrapper if the WebView2 Runtime is missing.
 
 ## Platform Status
 
@@ -50,7 +52,7 @@ rekordport is a tool for scanning a rekordbox library, finding hi-res files CDJs
 Install frontend dependencies:
 
 ```bash
-npm install
+npm ci
 ```
 
 Run the desktop app in development mode:
@@ -59,11 +61,10 @@ Run the desktop app in development mode:
 npm run tauri dev
 ```
 
-The desktop app requires one of these setups:
+Local development requires Node.js and the Rust toolchain. Scanning and conversion also require `sqlcipher` and `ffmpeg`, provided by one of these runtime setups:
 
-- Rust toolchain installed locally
-- `sqlcipher` and `ffmpeg` available in your system `PATH`
-- Or platform sidecars placed in `src-tauri/bin`
+- Platform sidecars placed in `src-tauri/bin`
+- Or `sqlcipher` and `ffmpeg` available in your system `PATH`
 
 ## Build And Checks
 
@@ -92,8 +93,10 @@ The app looks for conversion dependencies in this order:
 1. Environment variable overrides
    - `RKB_SQLCIPHER_PATH`
    - `RKB_FFMPEG_PATH`
-2. Bundled sidecars in `src-tauri/bin`
+2. Bundled sidecars in app resources or development sidecars in `src-tauri/bin`
 3. System `PATH`
+
+If an environment override is set, it must point at a runnable executable; rekordport will not silently fall back to another tool.
 
 See [src-tauri/bin/README.md](src-tauri/bin/README.md) for sidecar naming and packaging notes.
 

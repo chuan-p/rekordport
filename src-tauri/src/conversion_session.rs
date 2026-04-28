@@ -283,8 +283,12 @@ fn recover_manifest_entry(entry: &ConversionManifestEntry) -> ConversionRecovery
     let source = PathBuf::from(&entry.source_path);
     let archive = PathBuf::from(&entry.archive_path);
     let output = PathBuf::from(&entry.output_path);
+    let output_is_source = output == source;
 
-    if path_exists(&output).unwrap_or(false) {
+    let archive_exists = path_exists(&archive).unwrap_or(false);
+    let output_exists = path_exists(&output).unwrap_or(false);
+
+    if output_exists && (!output_is_source || archive_exists) {
         if let Err(error) = remove_file_path(&output) {
             report.errors.push(format!(
                 "failed to remove interrupted output {} for track {}: {}",
@@ -329,6 +333,12 @@ fn recover_manifest_entry(entry: &ConversionManifestEntry) -> ConversionRecovery
         report.errors.push(format!(
             "missing both source and archive while recovering interrupted conversion for track {}",
             entry.track_id
+        ));
+    } else if output_is_source {
+        report.warnings.push(format!(
+            "interrupted same-format conversion for track {} had not archived the source yet; kept original source {}",
+            entry.track_id,
+            source.display()
         ));
     }
 
@@ -820,6 +830,115 @@ mod tests {
         assert!(source.exists());
         assert!(!archive.exists());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn recover_stale_same_format_before_archive_keeps_source() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let db_path = dir.path().join("master.db");
+        let source = dir.path().join("track.wav");
+        let archive = backup_root.join("music/track-1536kbps.wav");
+
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("backup directories should be created");
+        fs::write(&db_path, b"converted database").expect("database fixture should be written");
+        fs::write(database_backup_path(&backup_root), b"original database")
+            .expect("database backup fixture should be written");
+        fs::write(&source, b"original audio").expect("source fixture should be written");
+
+        let entry = ConversionManifestEntry {
+            track_id: "1".to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            output_path: source.to_string_lossy().to_string(),
+        };
+        append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
+
+        let report = recover_stale_conversion_backups(dir.path(), &db_path)
+            .expect("stale conversion backup should be recoverable");
+
+        assert!(report.errors.is_empty());
+        assert!(source.exists());
+        assert!(!archive.exists());
+        assert!(!backup_root.join("manifest.jsonl").exists());
+        assert_eq!(
+            fs::read(&source).expect("source should be kept"),
+            b"original audio"
+        );
+    }
+
+    #[test]
+    fn recover_stale_same_format_after_archive_restores_source() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let db_path = dir.path().join("master.db");
+        let source = dir.path().join("track.wav");
+        let archive = backup_root.join("music/track-1536kbps.wav");
+
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("backup directories should be created");
+        fs::write(&db_path, b"converted database").expect("database fixture should be written");
+        fs::write(database_backup_path(&backup_root), b"original database")
+            .expect("database backup fixture should be written");
+        fs::write(&archive, b"archived audio").expect("archive fixture should be written");
+
+        let entry = ConversionManifestEntry {
+            track_id: "1".to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            output_path: source.to_string_lossy().to_string(),
+        };
+        append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
+
+        let report = recover_stale_conversion_backups(dir.path(), &db_path)
+            .expect("stale conversion backup should be recoverable");
+
+        assert!(report.errors.is_empty());
+        assert!(source.exists());
+        assert!(!archive.exists());
+        assert!(!backup_root.join("manifest.jsonl").exists());
+        assert_eq!(
+            fs::read(&source).expect("source should be restored"),
+            b"archived audio"
+        );
+    }
+
+    #[test]
+    fn recover_stale_same_format_after_output_replaces_converted_with_archive() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let backup_root = dir.path().join("rekordport-backup-123");
+        let db_path = dir.path().join("master.db");
+        let source = dir.path().join("track.wav");
+        let archive = backup_root.join("music/track-1536kbps.wav");
+
+        fs::create_dir_all(archive.parent().expect("archive parent should exist"))
+            .expect("backup directories should be created");
+        fs::write(&db_path, b"converted database").expect("database fixture should be written");
+        fs::write(database_backup_path(&backup_root), b"original database")
+            .expect("database backup fixture should be written");
+        fs::write(&source, b"converted audio").expect("source output should be written");
+        fs::write(&archive, b"archived audio").expect("archive fixture should be written");
+
+        let entry = ConversionManifestEntry {
+            track_id: "1".to_string(),
+            source_path: source.to_string_lossy().to_string(),
+            archive_path: archive.to_string_lossy().to_string(),
+            output_path: source.to_string_lossy().to_string(),
+        };
+        append_manifest_entry(&backup_root, &entry).expect("manifest should be written");
+
+        let report = recover_stale_conversion_backups(dir.path(), &db_path)
+            .expect("stale conversion backup should be recoverable");
+
+        assert!(report.errors.is_empty());
+        assert!(source.exists());
+        assert!(!archive.exists());
+        assert!(!backup_root.join("manifest.jsonl").exists());
+        assert_eq!(
+            fs::read(&source).expect("source should be restored"),
+            b"archived audio"
+        );
     }
 
     #[test]

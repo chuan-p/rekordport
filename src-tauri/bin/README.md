@@ -41,8 +41,10 @@ Tauri `externalBin` 已经配置为：
 1. 环境变量覆盖
    - `RKB_SQLCIPHER_PATH`
    - `RKB_FFMPEG_PATH`
-2. 当前目录和打包后的资源目录里的 sidecar
+2. 打包后的资源目录里的 sidecar，或开发环境的 `src-tauri/bin` sidecar
 3. 系统 PATH
+
+如果设置了环境变量覆盖，它必须指向可运行的对应工具；应用不会在覆盖无效时静默回退到 sidecar 或系统 PATH。
 
 ## 注意
 

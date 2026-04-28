@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::io::Read;
 use std::io::Seek;
@@ -32,6 +32,9 @@ mod process;
 
 const DEFAULT_KEY: &str = "402fd482c38817c35ffa8ffb8c7d93143b749e7d315df7a81732a1ff43608497";
 const LATEST_RELEASE_URL: &str = "https://github.com/chuan-p/rekordport/releases/latest";
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const PREVIEW_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const PREVIEW_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const HI_RES_SAMPLE_RATE_THRESHOLD: u32 = 48_000;
 #[cfg(test)]
 const WAV_FORMAT_TAG_PCM: u16 = 0x0001;
@@ -53,6 +56,8 @@ struct ScanRequest {
     min_bit_depth: u32,
     #[serde(rename = "includeSampler")]
     include_sampler: bool,
+    #[serde(rename = "operationId", default)]
+    operation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -91,6 +96,8 @@ struct ConvertRequest {
     archive_conflict_resolution: Option<String>,
     #[serde(rename = "outputConflictResolution", default)]
     output_conflict_resolution: Option<String>,
+    #[serde(rename = "operationId", default)]
+    operation_id: Option<String>,
     tracks: Vec<Track>,
 }
 
@@ -129,6 +136,28 @@ struct ScanProgressPayload {
     current: usize,
     total: usize,
     message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ProgressEventPayload {
+    #[serde(rename = "operationId", skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
+    phase: String,
+    current: usize,
+    total: usize,
+    message: String,
+}
+
+impl ProgressEventPayload {
+    fn new(operation_id: Option<String>, payload: ScanProgressPayload) -> Self {
+        Self {
+            operation_id,
+            phase: payload.phase,
+            current: payload.current,
+            total: payload.total,
+            message: payload.message,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +334,16 @@ static COMMAND_PATH_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = O
 static ENCODER_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static AUDIO_PROBE_CACHE: OnceLock<Mutex<HashMap<PathBuf, AudioProbeCacheEntry>>> = OnceLock::new();
 static CONVERSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct DatabaseConversionLock {
+    path: PathBuf,
+}
+
+impl Drop for DatabaseConversionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 static TIMESTAMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn refresh_command_discovery_caches() {
@@ -589,14 +628,6 @@ fn sidecar_filename(command: &str) -> String {
     }
 }
 
-fn executable_filename(command: &str) -> String {
-    if cfg!(target_os = "windows") {
-        format!("{command}.exe")
-    } else {
-        command.to_string()
-    }
-}
-
 include!(concat!(env!("OUT_DIR"), "/embedded_windows_sidecars.rs"));
 
 fn embedded_windows_sidecar_path(command: &str) -> Option<PathBuf> {
@@ -660,8 +691,6 @@ fn candidate_search_roots() -> Vec<PathBuf> {
 
     if let Ok(cwd) = env::current_dir() {
         push_root(cwd.join("src-tauri").join("bin"));
-        push_root(cwd.join("bin"));
-        push_root(cwd);
     }
 
     roots
@@ -785,6 +814,13 @@ fn create_dir_all_path(path: &Path) -> Result<(), String> {
     )
 }
 
+fn create_dir_path(path: &Path) -> Result<(), String> {
+    retry_io_operation(
+        format!("failed to create directory {}", path.display()),
+        || fs::create_dir(path),
+    )
+}
+
 fn metadata_path(path: &Path) -> Result<fs::Metadata, String> {
     retry_io_operation(
         format!("failed to read metadata for {}", path.display()),
@@ -842,6 +878,54 @@ fn preview_cache_root() -> Result<PathBuf, String> {
     cache_root.push("rekordport-preview-cache");
     create_dir_all_path(&cache_root)?;
     Ok(cache_root)
+}
+
+fn cleanup_preview_cache() -> Result<(), String> {
+    let cache_root = preview_cache_root()?;
+    let now = SystemTime::now();
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+
+    for entry in read_dir_path(&cache_root)? {
+        let entry = entry.map_err(|error| {
+            io_error_message(
+                &format!(
+                    "failed to read preview cache entry in {}",
+                    cache_root.display()
+                ),
+                &error,
+            )
+        })?;
+        let path = entry.path();
+        let meta = match metadata_path(&path) {
+            Ok(meta) if meta.is_file() => meta,
+            _ => continue,
+        };
+        let size = meta.len();
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        if now
+            .duration_since(modified)
+            .map(|age| age > PREVIEW_CACHE_MAX_AGE)
+            .unwrap_or(false)
+        {
+            let _ = remove_file_path(&path);
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(size);
+        entries.push((modified, size, path));
+    }
+
+    entries.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in entries {
+        if total_bytes <= PREVIEW_CACHE_MAX_BYTES {
+            break;
+        }
+        if remove_file_path(&path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+
+    Ok(())
 }
 
 fn preview_cache_token(source: &Path, suffix: &str) -> Result<String, String> {
@@ -1029,6 +1113,7 @@ fn preview_path_string(path: &Path) -> String {
 
 fn prepare_preview_path_impl(path: String) -> Result<String, String> {
     refresh_command_discovery_caches();
+    let _ = cleanup_preview_cache();
     let source = PathBuf::from(&path);
     if !path_exists(&source)? {
         return Err(format!("path not found: {}", source.display()));
@@ -1072,16 +1157,15 @@ fn resolve_command(command: &str) -> Option<PathBuf> {
                 if candidate.exists() && command_exists_at(&candidate) {
                     return Some(candidate);
                 }
+                return None;
             }
         }
 
         let sidecar = sidecar_filename(command);
-        let plain = executable_filename(command);
         for root in candidate_search_roots() {
-            for candidate in [root.join(&sidecar), root.join(&plain)] {
-                if candidate.exists() && command_exists_at(&candidate) {
-                    return Some(candidate);
-                }
+            let candidate = root.join(&sidecar);
+            if candidate.exists() && command_exists_at(&candidate) {
+                return Some(candidate);
             }
         }
 
@@ -1101,6 +1185,19 @@ fn resolve_command(command: &str) -> Option<PathBuf> {
     let mut guard = cache.lock().expect("command path cache lock poisoned");
     guard.insert(command.to_string(), resolved.clone());
     resolved
+}
+
+fn invalid_tool_override_message(command: &str) -> Option<String> {
+    let env_name = tool_override_var(command)?;
+    let value = env::var_os(env_name)?;
+    let candidate = PathBuf::from(value);
+    if candidate.exists() && command_exists_at(&candidate) {
+        return None;
+    }
+    Some(format!(
+        "{env_name} is set to {}, but that path is not a runnable {command} executable",
+        candidate.display()
+    ))
 }
 
 fn is_bundled_command_path(path: &Path) -> bool {
@@ -1136,8 +1233,10 @@ fn command_source(command: &str) -> Option<String> {
 }
 
 fn prepared_command(command: &str) -> Result<Command, String> {
-    let resolved = resolve_command(command)
-        .ok_or_else(|| format!("{command} command not found in PATH or bundled sidecar"))?;
+    let resolved = resolve_command(command).ok_or_else(|| {
+        invalid_tool_override_message(command)
+            .unwrap_or_else(|| format!("{command} command not found in PATH or bundled sidecar"))
+    })?;
     Ok(Command::new(resolved))
 }
 
@@ -2678,7 +2777,7 @@ fn next_numeric_text_id(db_path: &Path, key: &str, table: &str) -> Result<String
         db_path,
         key,
         &format!(
-            "SELECT CAST(COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 AS TEXT) FROM {table} WHERE ID GLOB '[0-9]*';"
+            "SELECT CAST(COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 AS TEXT) FROM {table} WHERE ID <> '' AND ID NOT GLOB '*[^0-9]*';"
         ),
         &format!("expected next id for {table}"),
     )
@@ -3315,15 +3414,122 @@ fn check_database_readable(db_path: &Path, key: &str) -> bool {
     run_sqlcipher(db_path, key, "SELECT COUNT(*) FROM djmdContent LIMIT 1;").is_ok()
 }
 
+fn check_sqlcipher_json_available(db_path: &Path, key: &str) -> bool {
+    if !db_path.exists() || !command_available("sqlcipher") {
+        return false;
+    }
+
+    run_sqlcipher(db_path, key, "SELECT json_quote('x'), json_type('[]');").is_ok()
+}
+
+const ROLLBACK_FAILED_MARKER: &str = "Rollback also failed:";
+
 fn append_rollback_errors(error: String, rollback_errors: Vec<String>) -> String {
     if rollback_errors.is_empty() {
         return error;
     }
 
     format!(
-        "{error}. Rollback also failed: {}",
+        "{error}. {ROLLBACK_FAILED_MARKER} {}",
         rollback_errors.join(" | ")
     )
+}
+
+fn error_contains_rollback_failure(error: &str) -> bool {
+    error.contains(ROLLBACK_FAILED_MARKER)
+}
+
+fn rollback_current_conversion(
+    temp_output_path: &Path,
+    archive_path: &Path,
+    source: &Path,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if path_exists(temp_output_path).unwrap_or(false) {
+        if let Err(error) = remove_file_path(temp_output_path) {
+            errors.push(format!(
+                "failed to remove temporary output {}: {}",
+                temp_output_path.display(),
+                error
+            ));
+        }
+    }
+
+    if path_exists(archive_path).unwrap_or(false) {
+        if let Err(error) = rename_path(archive_path, source) {
+            errors.push(format!(
+                "failed to restore archived source {} -> {}: {}",
+                archive_path.display(),
+                source.display(),
+                error
+            ));
+        }
+    } else {
+        errors.push(format!(
+            "missing archived source {} while rolling back current track {}",
+            archive_path.display(),
+            source.display()
+        ));
+    }
+
+    errors
+}
+
+fn restore_database_backup(db_backup: &Path, db_path: &Path) -> Vec<String> {
+    match copy_path(db_backup, db_path) {
+        Ok(_) => Vec::new(),
+        Err(error) => vec![format!(
+            "failed to restore database backup {} -> {}: {}",
+            db_backup.display(),
+            db_path.display(),
+            error
+        )],
+    }
+}
+
+fn acquire_database_conversion_lock(db_path: &Path) -> Result<DatabaseConversionLock, String> {
+    let parent = db_path
+        .parent()
+        .ok_or_else(|| format!("missing parent directory for {}", db_path.display()))?;
+    let lock_path = parent.join(".rekordport-conversion.lock");
+    let mut lock_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                let owner = fs::read_to_string(&lock_path)
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| "another rekordport process".to_string());
+                format!(
+                    "another conversion or recovery appears to be running for this library ({owner}). If rekordport previously crashed, close other instances and remove {} only after confirming no conversion is active.",
+                    lock_path.display()
+                )
+            } else {
+                io_error_message(
+                    &format!("failed to create conversion lock {}", lock_path.display()),
+                    &error,
+                )
+            }
+        })?;
+
+    writeln!(
+        lock_file,
+        "pid={} db={}",
+        std::process::id(),
+        db_path.display()
+    )
+    .map_err(|error| {
+        let _ = fs::remove_file(&lock_path);
+        io_error_message(
+            &format!("failed to write conversion lock {}", lock_path.display()),
+            &error,
+        )
+    })?;
+
+    Ok(DatabaseConversionLock { path: lock_path })
 }
 
 fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
@@ -3346,15 +3552,28 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     } else {
         false
     };
+    let mut json_available =
+        db_readable && check_sqlcipher_json_available(&db_path_buf, DEFAULT_KEY);
 
     let mut warnings = Vec::new();
+    let mut preflight_database_lock = None;
     if db_exists {
+        match acquire_database_conversion_lock(&db_path_buf) {
+            Ok(lock) => preflight_database_lock = Some(lock),
+            Err(error) => warnings.push(format!(
+                "skipped interrupted-conversion recovery while checking this library: {error}"
+            )),
+        }
+    }
+    if db_exists && preflight_database_lock.is_some() {
         if let Some(backup_parent) = db_path_buf.parent() {
             match conversion_session::recover_stale_conversion_backups(backup_parent, &db_path_buf) {
                 Ok(report) => {
                     warnings.extend(report.warnings);
                     warnings.extend(report.errors);
                     db_readable = check_database_readable(&db_path_buf, DEFAULT_KEY);
+                    json_available =
+                        db_readable && check_sqlcipher_json_available(&db_path_buf, DEFAULT_KEY);
                 }
                 Err(error) => warnings.push(format!(
                     "failed to recover interrupted conversion backups while checking this library: {}",
@@ -3404,9 +3623,12 @@ fn preflight_impl(req: PreflightRequest) -> PreflightResponse {
     if ffmpeg_available && !png_encoder_available {
         warnings.push("The current ffmpeg build does not include the PNG encoder, so embedded cover art will be skipped during conversion.".to_string());
     }
+    if db_readable && !json_available {
+        warnings.push("The current sqlcipher build does not include SQLite JSON functions required for cue migration during conversion.".to_string());
+    }
 
     let scan_ready = sqlcipher_available && db_readable;
-    let convert_ready = ffmpeg_available && sqlcipher_available && db_readable;
+    let convert_ready = ffmpeg_available && sqlcipher_available && db_readable && json_available;
 
     PreflightResponse {
         os: platform_name(),
@@ -3647,35 +3869,34 @@ fn convert_one_track(
     })();
 
     if let Err(error) = conversion_result {
-        let _ = remove_file_path(&temp_output_path);
-        let _ = rename_path(&archive_path, source);
-        return Err(error);
+        let rollback_errors = rollback_current_conversion(&temp_output_path, &archive_path, source);
+        return Err(append_rollback_errors(error, rollback_errors));
     }
 
     if path_exists(&output_path)? {
         match output_conflict_resolution {
             ConflictResolution::Error => {
-                let _ = remove_file_path(&temp_output_path);
-                let _ = rename_path(&archive_path, source);
-                return Err(format!(
-                    "target file already exists: {}",
-                    output_path.display()
+                let rollback_errors =
+                    rollback_current_conversion(&temp_output_path, &archive_path, source);
+                return Err(append_rollback_errors(
+                    format!("target file already exists: {}", output_path.display()),
+                    rollback_errors,
                 ));
             }
             ConflictResolution::Overwrite => {
                 if let Err(error) = remove_file_path(&output_path) {
-                    let _ = remove_file_path(&temp_output_path);
-                    let _ = rename_path(&archive_path, source);
-                    return Err(error);
+                    let rollback_errors =
+                        rollback_current_conversion(&temp_output_path, &archive_path, source);
+                    return Err(append_rollback_errors(error, rollback_errors));
                 }
             }
             ConflictResolution::Redirect => {
                 output_path = match unique_redirect_path(&output_path) {
                     Ok(path) => path,
                     Err(error) => {
-                        let _ = remove_file_path(&temp_output_path);
-                        let _ = rename_path(&archive_path, source);
-                        return Err(error);
+                        let rollback_errors =
+                            rollback_current_conversion(&temp_output_path, &archive_path, source);
+                        return Err(append_rollback_errors(error, rollback_errors));
                     }
                 };
             }
@@ -3683,9 +3904,8 @@ fn convert_one_track(
     }
 
     if let Err(error) = rename_path(&temp_output_path, &output_path) {
-        let _ = remove_file_path(&temp_output_path);
-        let _ = rename_path(&archive_path, source);
-        return Err(error);
+        let rollback_errors = rollback_current_conversion(&temp_output_path, &archive_path, source);
+        return Err(append_rollback_errors(error, rollback_errors));
     }
 
     let channels = source_probe.channels.unwrap_or(2);
@@ -3920,8 +4140,8 @@ fn migrate_tracks_in_db(
             "CREATE TEMP TABLE IF NOT EXISTS migration_state (next_id INTEGER NOT NULL);\n",
         );
         sql.push_str("DELETE FROM migration_state;\n");
-        sql.push_str("INSERT INTO migration_state (next_id) SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdContent WHERE ID GLOB '[0-9]*';\n");
-        sql.push_str("CREATE TEMP TABLE IF NOT EXISTS migration_results (source_id TEXT NOT NULL, new_id TEXT NOT NULL, new_uuid TEXT NOT NULL);\n");
+        sql.push_str("INSERT INTO migration_state (next_id) SELECT COALESCE(MAX(CAST(ID AS INTEGER)), 0) + 1 FROM djmdContent WHERE ID <> '' AND ID NOT GLOB '*[^0-9]*';\n");
+        sql.push_str("CREATE TEMP TABLE IF NOT EXISTS migration_results (source_id TEXT NOT NULL, new_id TEXT NOT NULL, new_uuid TEXT NOT NULL, offset_ms INTEGER NOT NULL);\n");
         sql.push_str("DELETE FROM migration_results;\n");
 
         let new_content_id_expr = "(SELECT CAST(next_id AS TEXT) FROM migration_state LIMIT 1)";
@@ -4304,9 +4524,10 @@ fn migrate_tracks_in_db(
                 sql_quote(&track.id),
             ));
             sql.push_str(&format!(
-        "INSERT INTO migration_results (source_id, new_id, new_uuid) VALUES ({}, {new_content_id_expr}, {});\n",
+        "INSERT INTO migration_results (source_id, new_id, new_uuid, offset_ms) VALUES ({}, {new_content_id_expr}, {}, {});\n",
         sql_quote(&track.id),
         sql_quote(&content_uuid),
+        encoder_priming_offset_ms,
       ));
             sql.push_str("UPDATE migration_state SET next_id = next_id + 1;\n");
         }
@@ -4327,8 +4548,8 @@ fn migrate_tracks_in_db(
                 assignments.push(
                     "Cues = CASE
     WHEN Cues IS NULL THEN NULL
-    WHEN json_type(Cues) = 'array' THEN COALESCE((SELECT json_group_array(CASE WHEN json_type(value) = 'object' THEN json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE value END) FROM json_each(contentCue.Cues)), '[]')
-    WHEN json_type(Cues) = 'object' THEN json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1))
+    WHEN json_type(Cues) = 'array' THEN COALESCE((SELECT json_group_array(CASE WHEN json_type(value) = 'object' THEN CASE WHEN json_type(value, '$.CueMsec') IN ('integer', 'real') AND json_extract(value, '$.CueMsec') >= 0 THEN json_set(json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.CueMsec', json_extract(value, '$.CueMsec') + (SELECT offset_ms FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) END ELSE value END) FROM json_each(contentCue.Cues)), '[]')
+    WHEN json_type(Cues) = 'object' THEN CASE WHEN json_type(Cues, '$.CueMsec') IN ('integer', 'real') AND json_extract(Cues, '$.CueMsec') >= 0 THEN json_set(json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.CueMsec', json_extract(Cues, '$.CueMsec') + (SELECT offset_ms FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) END
     ELSE Cues
   END"
                     .to_string(),
@@ -4421,6 +4642,12 @@ where
     if !path_exists(&db_path)? {
         return Err(format!("database file not found: {}", db_path.display()));
     }
+    if !check_sqlcipher_json_available(&db_path, DEFAULT_KEY) {
+        return Err(
+            "sqlcipher was built without SQLite JSON functions required for cue migration"
+                .to_string(),
+        );
+    }
 
     if spec.extension == "m4a" && !ffmpeg_has_encoder("aac_at")? {
         return Err(
@@ -4463,15 +4690,15 @@ where
         }
     }
 
-    let timestamp = timestamp_token();
     let backup_root = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(format!(
-            "{}{timestamp}",
-            conversion_session::BACKUP_DIR_PREFIX
+            "{}{}",
+            conversion_session::BACKUP_DIR_PREFIX,
+            Uuid::new_v4()
         ));
-    create_dir_all_path(&backup_root)?;
+    create_dir_path(&backup_root)?;
 
     let db_backup = backup_root.join("master.db");
     copy_path(&db_path, &db_backup)?;
@@ -4513,7 +4740,7 @@ where
             }
             Err(error) => {
                 let rollback_errors = session.rollback_all();
-                if rollback_errors.is_empty() {
+                if rollback_errors.is_empty() && !error_contains_rollback_failure(&error) {
                     let _ = conversion_session::remove_manifest(&backup_root);
                 }
                 return Err(append_rollback_errors(error, rollback_errors));
@@ -4533,7 +4760,8 @@ where
         match migrate_tracks_in_db(&db_path, &req.tracks, &converted_tracks, DEFAULT_KEY, &spec) {
             Ok(tracks) => tracks,
             Err(error) => {
-                let rollback_errors = session.rollback_all();
+                let mut rollback_errors = session.rollback_all();
+                rollback_errors.extend(restore_database_backup(&db_backup, &db_path));
                 if rollback_errors.is_empty() {
                     let _ = conversion_session::remove_manifest(&backup_root);
                 }
@@ -4902,7 +5130,12 @@ fn open_external_url(url: String) -> Result<(), String> {
 }
 
 fn latest_release_impl() -> Result<LatestReleaseResponse, String> {
-    let response = ureq::get(LATEST_RELEASE_URL)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(UPDATE_CHECK_TIMEOUT)
+        .timeout_read(UPDATE_CHECK_TIMEOUT)
+        .build();
+    let response = agent
+        .get(LATEST_RELEASE_URL)
         .set(
             "User-Agent",
             concat!("rekordport/", env!("CARGO_PKG_VERSION")),
@@ -4928,7 +5161,12 @@ fn latest_release_impl() -> Result<LatestReleaseResponse, String> {
 fn fetch_release_changelog(tag_name: &str) -> Option<String> {
     let url =
         format!("https://raw.githubusercontent.com/chuan-p/rekordport/{tag_name}/CHANGELOG.md");
-    ureq::get(&url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(UPDATE_CHECK_TIMEOUT)
+        .timeout_read(UPDATE_CHECK_TIMEOUT)
+        .build();
+    agent
+        .get(&url)
         .set(
             "User-Agent",
             concat!("rekordport/", env!("CARGO_PKG_VERSION")),
@@ -4950,8 +5188,12 @@ async fn latest_release() -> Result<LatestReleaseResponse, String> {
 #[tauri::command]
 async fn scan_library(app: tauri::AppHandle, req: ScanRequest) -> Result<ScanResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let operation_id = req.operation_id.clone();
         scan_impl_with_progress(req, |payload| {
-            let _ = app.emit("scan-progress", payload);
+            let _ = app.emit(
+                "scan-progress",
+                ProgressEventPayload::new(operation_id.clone(), payload),
+            );
         })
     })
     .await
@@ -4971,24 +5213,38 @@ async fn convert_tracks(
     req: ConvertRequest,
 ) -> Result<ConvertResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let operation_id = req.operation_id.clone();
         let conversion_lock = CONVERSION_LOCK.get_or_init(|| Mutex::new(()));
         let _conversion_guard = conversion_lock
             .try_lock()
             .map_err(|_| "another conversion is already running".to_string())?;
+        let _database_lock = acquire_database_conversion_lock(Path::new(&req.db_path))?;
+        if process::rekordbox_process_running()? {
+            return Err(
+                "rekordbox appears to be running. Close rekordbox before converting, then try again. No files or database rows were changed."
+                    .to_string(),
+            );
+        }
 
         let result = convert_impl_with_progress(req, |payload| {
-            let _ = app.emit("convert-progress", payload);
+            let _ = app.emit(
+                "convert-progress",
+                ProgressEventPayload::new(operation_id.clone(), payload),
+            );
         });
 
         if let Err(error) = &result {
             let _ = app.emit(
                 "convert-progress",
-                ScanProgressPayload {
-                    phase: "error".to_string(),
-                    current: 0,
-                    total: 0,
-                    message: error.clone(),
-                },
+                ProgressEventPayload::new(
+                    operation_id.clone(),
+                    ScanProgressPayload {
+                        phase: "error".to_string(),
+                        current: 0,
+                        total: 0,
+                        message: error.clone(),
+                    },
+                ),
             );
         }
 
@@ -5587,6 +5843,41 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
     }
 
     #[test]
+    fn current_conversion_rollback_reports_restore_failure() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let source = dir.path().join("track.flac");
+        let archive = dir.path().join("missing-archive.flac");
+        let temp_output = dir.path().join("temp.wav");
+
+        fs::write(&temp_output, b"partial output").expect("temp output should be written");
+
+        let errors = rollback_current_conversion(&temp_output, &archive, &source);
+
+        assert!(!temp_output.exists());
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing archived source")));
+    }
+
+    #[test]
+    fn restore_database_backup_replaces_database() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let db_path = dir.path().join("master.db");
+        let db_backup = dir.path().join("master.backup.db");
+
+        fs::write(&db_path, b"mutated database").expect("database should be written");
+        fs::write(&db_backup, b"original database").expect("backup should be written");
+
+        let errors = restore_database_backup(&db_backup, &db_path);
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            fs::read(&db_path).expect("database should be readable"),
+            b"original database"
+        );
+    }
+
+    #[test]
     fn sqlcipher_bails_before_committing_after_statement_error() {
         if !command_available("sqlcipher") {
             eprintln!("skipping sqlcipher bail test because sqlcipher is unavailable");
@@ -5634,6 +5925,7 @@ COMMIT;
             db_path: db_path.clone(),
             min_bit_depth: 16,
             include_sampler: false,
+            operation_id: None,
         })
         .expect("scan should succeed");
 
@@ -5652,6 +5944,7 @@ COMMIT;
                 source_handling: "rename".to_string(),
                 archive_conflict_resolution: None,
                 output_conflict_resolution: None,
+                operation_id: None,
                 tracks: vec![track.clone()],
             },
             |_| {},

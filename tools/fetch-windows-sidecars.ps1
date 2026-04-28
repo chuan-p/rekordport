@@ -14,6 +14,12 @@ $targetTriple = if ($env:RKB_WINDOWS_TARGET_TRIPLE) {
 }
 
 $allowUnverifiedDownloads = $env:RKB_ALLOW_UNVERIFIED_DOWNLOADS -eq "1"
+if ($allowUnverifiedDownloads -and $env:CI -eq "true") {
+  throw "RKB_ALLOW_UNVERIFIED_DOWNLOADS=1 is not allowed in CI or release builds."
+}
+if ($allowUnverifiedDownloads) {
+  Write-Warning "RKB_ALLOW_UNVERIFIED_DOWNLOADS=1 is for local experiments only. Do not use it for release builds."
+}
 
 $pinnedFfmpeg = @{
   "x86_64-pc-windows-msvc" = @{

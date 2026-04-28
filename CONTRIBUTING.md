@@ -36,7 +36,6 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## Notes
 
-- The Tauri app is the main product surface.
-- The Python script is still useful as a CLI scanner and reference implementation.
+- The Tauri desktop app is the only supported product surface.
 - Sidecars are optional in development if `sqlcipher` and `ffmpeg` are already available in `PATH`.
 - Windows sidecar downloads should stay pinned to exact upstream artifacts and SHA-256 hashes.

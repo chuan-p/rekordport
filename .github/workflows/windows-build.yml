@@ -131,5 +131,5 @@ jobs:
             gh release create $tag --title $tag --notes "Automated Windows portable executable build."
           }
 
-          gh release delete-asset $tag "rekordport.exe" --yes *> $null
+          gh release delete-asset $tag "${{ steps.portable_release.outputs.release_name }}" --yes *> $null
           gh release upload $tag $exe --clobber
