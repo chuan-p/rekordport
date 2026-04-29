@@ -22,8 +22,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use tempfile::Builder as TempBuilder;
 use uuid::Uuid;
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
 
 mod conversion_session;
 #[cfg(test)]
@@ -160,25 +158,6 @@ impl ProgressEventPayload {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ExportRequest {
-    #[serde(rename = "dbPath")]
-    db_path: String,
-    #[serde(rename = "minBitDepth")]
-    min_bit_depth: u32,
-    #[serde(rename = "includeSampler")]
-    include_sampler: bool,
-    #[serde(rename = "outputPath")]
-    output_path: String,
-    format: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ExportResponse {
-    output_path: String,
-    rows: usize,
-}
-
 #[derive(Debug, Serialize)]
 struct ConvertResponse {
     backup_dir: String,
@@ -251,6 +230,15 @@ struct MigratedContentFile {
     new_local_path: Option<String>,
     hash: String,
     size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ContentCueRewrite {
+    old_content_id: String,
+    old_content_uuid: String,
+    new_content_id: String,
+    new_content_uuid: String,
+    offset_ms: u32,
 }
 
 #[derive(Debug)]
@@ -857,12 +845,6 @@ fn canonicalize_path(path: &Path) -> Result<PathBuf, String> {
 fn open_file_path(path: &Path) -> Result<fs::File, String> {
     retry_io_operation(format!("failed to open {}", path.display()), || {
         fs::File::open(path)
-    })
-}
-
-fn create_file_path(path: &Path) -> Result<fs::File, String> {
-    retry_io_operation(format!("failed to create {}", path.display()), || {
-        fs::File::create(path)
     })
 }
 
@@ -2133,15 +2115,6 @@ where
     Ok(ScanOutcome { tracks, stats })
 }
 
-fn scan_tracks(
-    db_path: &Path,
-    key: &str,
-    min_bit_depth: u32,
-    include_sampler: bool,
-) -> Result<Vec<Track>, String> {
-    Ok(scan_tracks_with_progress(db_path, key, min_bit_depth, include_sampler, |_| {})?.tracks)
-}
-
 fn library_track_total(db_path: &Path, key: &str, include_sampler: bool) -> Result<usize, String> {
     let sampler_filter = if include_sampler {
         String::new()
@@ -2872,13 +2845,13 @@ fn djmd_cue_migration_sql(
     )
 }
 
-#[allow(dead_code)]
 fn rewrite_content_cues_json(
     text: &str,
     old_content_id: &str,
     old_content_uuid: &str,
     new_content_id: &str,
     new_content_uuid: &str,
+    offset_ms: u32,
 ) -> Result<(String, usize), String> {
     let mut value: serde_json::Value = serde_json::from_str(text).map_err(|error| {
         format!(
@@ -2887,23 +2860,25 @@ fn rewrite_content_cues_json(
         )
     })?;
 
-    let Some(items) = value.as_array_mut() else {
-        return Err(format!(
-            "contentCue JSON for content {} must be an array",
-            old_content_id
-        ));
+    let cue_count = match &value {
+        serde_json::Value::Array(items) => items.len(),
+        serde_json::Value::Object(_) => 1,
+        _ => {
+            return Err(format!(
+                "contentCue JSON for content {} must be an array or object",
+                old_content_id
+            ))
+        }
     };
-    let cue_count = items.len();
 
-    for item in &mut *items {
-        let _ = rewrite_content_cues_value(
-            item,
-            old_content_id,
-            old_content_uuid,
-            new_content_id,
-            new_content_uuid,
-        );
-    }
+    let _ = rewrite_content_cues_value(
+        &mut value,
+        old_content_id,
+        old_content_uuid,
+        new_content_id,
+        new_content_uuid,
+        offset_ms,
+    );
 
     let rewritten = serde_json::to_string(&value).map_err(|error| {
         format!(
@@ -2922,6 +2897,7 @@ fn rewrite_content_cues_value(
     old_content_uuid: &str,
     new_content_id: &str,
     new_content_uuid: &str,
+    offset_ms: u32,
 ) -> usize {
     match value {
         serde_json::Value::Object(map) => {
@@ -2940,6 +2916,18 @@ fn rewrite_content_cues_value(
                             replacements += 1;
                         }
                     }
+                    "CueMsec" | "InMsec" | "OutMsec" => {
+                        replacements += add_json_u32_offset(nested, offset_ms, true);
+                    }
+                    "CueMicrosec" => {
+                        replacements +=
+                            add_json_u32_offset(nested, offset_ms.saturating_mul(1000), true);
+                    }
+                    "InFrame" | "OutFrame" => {
+                        let offset_frames = ((u64::from(offset_ms) * 150) + 500) / 1000;
+                        replacements +=
+                            add_json_u64_offset(nested, offset_frames, key != "OutFrame");
+                    }
                     _ => {
                         replacements += rewrite_content_cues_value(
                             nested,
@@ -2947,6 +2935,7 @@ fn rewrite_content_cues_value(
                             old_content_uuid,
                             new_content_id,
                             new_content_uuid,
+                            offset_ms,
                         );
                     }
                 }
@@ -2962,11 +2951,104 @@ fn rewrite_content_cues_value(
                     old_content_uuid,
                     new_content_id,
                     new_content_uuid,
+                    offset_ms,
                 )
             })
             .sum(),
         _ => 0,
     }
+}
+
+fn add_json_u32_offset(value: &mut serde_json::Value, offset: u32, include_zero: bool) -> usize {
+    add_json_u64_offset(value, u64::from(offset), include_zero)
+}
+
+fn add_json_u64_offset(value: &mut serde_json::Value, offset: u64, include_zero: bool) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    let Some(current) = value.as_i64() else {
+        return 0;
+    };
+    if current < 0 || (!include_zero && current == 0) {
+        return 0;
+    }
+    let Some(updated) = u64::try_from(current)
+        .ok()
+        .and_then(|current| current.checked_add(offset))
+    else {
+        return 0;
+    };
+    *value = serde_json::Value::Number(serde_json::Number::from(updated));
+    1
+}
+
+fn decode_hex_text(hex: &str) -> Result<String, String> {
+    if hex.len() % 2 != 0 {
+        return Err("hex text has an odd number of characters".to_string());
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for index in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[index..index + 2], 16)
+            .map_err(|error| format!("invalid hex text at byte {}: {}", index / 2, error))?;
+        bytes.push(byte);
+    }
+    String::from_utf8(bytes).map_err(|error| format!("contentCue JSON is not UTF-8: {error}"))
+}
+
+fn rewrite_content_cues_rows(
+    db_path: &Path,
+    key: &str,
+    rewrites: &[ContentCueRewrite],
+    now_expr: &str,
+    has_rb_cue_count: bool,
+    has_updated_at: bool,
+) -> Result<(), String> {
+    if rewrites.is_empty() {
+        return Ok(());
+    }
+
+    let mut sql = String::from("BEGIN IMMEDIATE;\n");
+    for rewrite in rewrites {
+        let rows = sqlcipher_lines(
+            db_path,
+            key,
+            &format!(
+                "SELECT rowid || '|' || hex(Cues) FROM contentCue WHERE ContentID = {} AND Cues IS NOT NULL;",
+                sql_quote(&rewrite.new_content_id)
+            ),
+        )?;
+
+        for row in rows {
+            let (rowid, cues_hex) = row
+                .split_once('|')
+                .ok_or_else(|| format!("unexpected contentCue row while rewriting JSON: {row}"))?;
+            let cues_text = decode_hex_text(cues_hex)?;
+            let (rewritten, cue_count) = rewrite_content_cues_json(
+                &cues_text,
+                &rewrite.old_content_id,
+                &rewrite.old_content_uuid,
+                &rewrite.new_content_id,
+                &rewrite.new_content_uuid,
+                rewrite.offset_ms,
+            )?;
+            let mut assignments = vec![format!("Cues = {}", sql_quote(&rewritten))];
+            if has_rb_cue_count {
+                assignments.push(format!("rb_cue_count = {cue_count}"));
+            }
+            if has_updated_at {
+                assignments.push(format!("updated_at = {now_expr}"));
+            }
+            sql.push_str(&format!(
+                "UPDATE contentCue SET {} WHERE rowid = {};\n",
+                assignments.join(", "),
+                rowid
+            ));
+        }
+    }
+    sql.push_str("COMMIT;\n");
+
+    run_sqlcipher(db_path, key, &sql).map(|_| ())
 }
 
 fn md5_hex(path: &Path) -> Result<String, String> {
@@ -2985,190 +3067,6 @@ fn md5_hex(path: &Path) -> Result<String, String> {
     }
 
     Ok(format!("{:x}", context.compute()))
-}
-
-fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
-
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn write_csv_export(path: &Path, tracks: &[Track]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        create_dir_all_path(parent)?;
-    }
-
-    let mut content = String::from(
-        "id,title,artist,file_type,codec_name,bit_depth,sample_rate,bitrate,full_path\n",
-    );
-    for track in tracks {
-        let row = [
-            track.id.as_str(),
-            track.title.as_str(),
-            track.artist.as_str(),
-            track.file_type.as_str(),
-            track.codec_name.as_deref().unwrap_or(""),
-            &track
-                .bit_depth
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            &track
-                .sample_rate
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            &track
-                .bitrate
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            track.full_path.as_str(),
-        ];
-        content.push_str(
-            &row.iter()
-                .map(|value| csv_escape(value))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        content.push('\n');
-    }
-
-    write_path(path, content)
-}
-
-fn excel_col_name(index: usize) -> String {
-    let mut index = index + 1;
-    let mut name = String::new();
-    while index > 0 {
-        let remainder = (index - 1) % 26;
-        name.insert(0, char::from(b'A' + remainder as u8));
-        index = (index - 1) / 26;
-    }
-    name
-}
-
-fn xlsx_cell(reference: &str, value: Option<&str>) -> String {
-    match value {
-        None => format!("<c r=\"{reference}\"/>"),
-        Some(text) if text.parse::<f64>().is_ok() && !text.is_empty() => {
-            format!("<c r=\"{reference}\"><v>{text}</v></c>")
-        }
-        Some(text) => format!(
-            "<c r=\"{reference}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>",
-            xml_escape(text)
-        ),
-    }
-}
-
-fn write_xlsx_export(path: &Path, tracks: &[Track]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        create_dir_all_path(parent)?;
-    }
-
-    let headers = [
-        "id",
-        "title",
-        "artist",
-        "file_type",
-        "codec_name",
-        "bit_depth",
-        "sample_rate",
-        "bitrate",
-        "full_path",
-    ];
-    let mut rows = Vec::new();
-    rows.push(
-        headers
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>(),
-    );
-    rows.extend(tracks.iter().map(|track| {
-        vec![
-            track.id.clone(),
-            track.title.clone(),
-            track.artist.clone(),
-            track.file_type.clone(),
-            track.codec_name.clone().unwrap_or_default(),
-            track
-                .bit_depth
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            track
-                .sample_rate
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            track
-                .bitrate
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            track.full_path.clone(),
-        ]
-    }));
-
-    let rows_xml = rows
-        .iter()
-        .enumerate()
-        .map(|(row_index, row)| {
-            let cells = row
-                .iter()
-                .enumerate()
-                .map(|(col_index, value)| {
-                    let reference = format!("{}{}", excel_col_name(col_index), row_index + 1);
-                    xlsx_cell(
-                        &reference,
-                        if value.is_empty() { None } else { Some(value) },
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            format!("<row r=\"{}\">{cells}</row>", row_index + 1)
-        })
-        .collect::<Vec<_>>()
-        .join("");
-
-    let sheet_xml = format!(
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>{rows_xml}</sheetData></worksheet>"
-  );
-    let workbook_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets><sheet name=\"Tracks\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>";
-    let workbook_rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/></Relationships>";
-    let root_rels_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>";
-    let content_types_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>";
-
-    let file = create_file_path(path)?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    zip.start_file("[Content_Types].xml", options)
-        .map_err(|e| e.to_string())?;
-    zip.write_all(content_types_xml.as_bytes())
-        .map_err(|e| e.to_string())?;
-    zip.start_file("_rels/.rels", options)
-        .map_err(|e| e.to_string())?;
-    zip.write_all(root_rels_xml.as_bytes())
-        .map_err(|e| e.to_string())?;
-    zip.start_file("xl/workbook.xml", options)
-        .map_err(|e| e.to_string())?;
-    zip.write_all(workbook_xml.as_bytes())
-        .map_err(|e| e.to_string())?;
-    zip.start_file("xl/_rels/workbook.xml.rels", options)
-        .map_err(|e| e.to_string())?;
-    zip.write_all(workbook_rels_xml.as_bytes())
-        .map_err(|e| e.to_string())?;
-    zip.start_file("xl/worksheets/sheet1.xml", options)
-        .map_err(|e| e.to_string())?;
-    zip.write_all(sheet_xml.as_bytes())
-        .map_err(|e| e.to_string())?;
-    zip.finish().map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 fn validate_analysis_resources(
@@ -3487,33 +3385,95 @@ fn restore_database_backup(db_backup: &Path, db_path: &Path) -> Vec<String> {
     }
 }
 
+fn parse_lock_pid(text: &str) -> Option<u32> {
+    text.split_whitespace()
+        .find_map(|part| part.strip_prefix("pid="))
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn process_id_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let output = hidden_windows_command("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        return output
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+            .unwrap_or(true);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status();
+        return status.map(|status| status.success()).unwrap_or(true);
+    }
+}
+
+fn remove_stale_database_conversion_lock(lock_path: &Path) -> Result<bool, String> {
+    let Ok(text) = fs::read_to_string(lock_path) else {
+        return Ok(false);
+    };
+    let Some(pid) = parse_lock_pid(&text) else {
+        return Ok(false);
+    };
+    if process_id_running(pid) {
+        return Ok(false);
+    }
+    remove_file_path(lock_path)?;
+    Ok(true)
+}
+
 fn acquire_database_conversion_lock(db_path: &Path) -> Result<DatabaseConversionLock, String> {
     let parent = db_path
         .parent()
         .ok_or_else(|| format!("missing parent directory for {}", db_path.display()))?;
     let lock_path = parent.join(".rekordport-conversion.lock");
-    let mut lock_file = OpenOptions::new()
+    let mut lock_file = match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&lock_path)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if remove_stale_database_conversion_lock(&lock_path)? {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+                    .map_err(|error| {
+                        io_error_message(
+                            &format!("failed to create conversion lock {}", lock_path.display()),
+                            &error,
+                        )
+                    })?
+            } else {
                 let owner = fs::read_to_string(&lock_path)
                     .ok()
                     .map(|text| text.trim().to_string())
                     .filter(|text| !text.is_empty())
                     .unwrap_or_else(|| "another rekordport process".to_string());
-                format!(
+                return Err(format!(
                     "another conversion or recovery appears to be running for this library ({owner}). If rekordport previously crashed, close other instances and remove {} only after confirming no conversion is active.",
                     lock_path.display()
-                )
-            } else {
-                io_error_message(
-                    &format!("failed to create conversion lock {}", lock_path.display()),
-                    &error,
-                )
+                ));
             }
-        })?;
+        }
+        Err(error) => {
+            return Err(io_error_message(
+                &format!("failed to create conversion lock {}", lock_path.display()),
+                &error,
+            ));
+        }
+    };
 
     writeln!(
         lock_file,
@@ -4134,6 +4094,7 @@ fn migrate_tracks_in_db(
     let djmd_cue_columns = schema_columns.get("djmdCue").cloned().unwrap_or_default();
     let now_expr = "strftime('%Y-%m-%d %H:%M:%f +00:00','now')";
     let mut copied_resources: Vec<PathBuf> = Vec::new();
+    let mut pending_content_cue_rewrites: Vec<ContentCueRewrite> = Vec::with_capacity(tracks.len());
     let result = (|| -> Result<Vec<Track>, String> {
         let mut sql = String::from("BEGIN IMMEDIATE;\n");
         sql.push_str(
@@ -4171,6 +4132,13 @@ fn migrate_tracks_in_db(
             let old_analysis_path = &source_data.old_analysis_path;
             let content_files = &source_data.content_files;
             let content_uuid = Uuid::new_v4().to_string();
+            pending_content_cue_rewrites.push(ContentCueRewrite {
+                old_content_id: track.id.clone(),
+                old_content_uuid: old_uuid.clone(),
+                new_content_id: String::new(),
+                new_content_uuid: content_uuid.clone(),
+                offset_ms: encoder_priming_offset_ms,
+            });
             let select_columns: Vec<String> = insert_columns
                 .iter()
                 .map(|column| match column.as_str() {
@@ -4411,6 +4379,7 @@ fn migrate_tracks_in_db(
                 {
                     assignments.push(updated_at);
                 }
+                // Smart playlists are rule-based; rekordbox refreshes them when the library opens.
                 let smart_list_filter =
                     if schema_has_column(&schema_columns, "djmdPlaylist", "SmartList") {
                         "COALESCE(SmartList, '') = ''"
@@ -4548,8 +4517,8 @@ fn migrate_tracks_in_db(
                 assignments.push(
                     "Cues = CASE
     WHEN Cues IS NULL THEN NULL
-    WHEN json_type(Cues) = 'array' THEN COALESCE((SELECT json_group_array(CASE WHEN json_type(value) = 'object' THEN CASE WHEN json_type(value, '$.CueMsec') IN ('integer', 'real') AND json_extract(value, '$.CueMsec') >= 0 THEN json_set(json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.CueMsec', json_extract(value, '$.CueMsec') + (SELECT offset_ms FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) END ELSE value END) FROM json_each(contentCue.Cues)), '[]')
-    WHEN json_type(Cues) = 'object' THEN CASE WHEN json_type(Cues, '$.CueMsec') IN ('integer', 'real') AND json_extract(Cues, '$.CueMsec') >= 0 THEN json_set(json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.CueMsec', json_extract(Cues, '$.CueMsec') + (SELECT offset_ms FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) END
+    WHEN json_type(Cues) = 'array' THEN COALESCE((SELECT json_group_array(CASE WHEN json_type(value) = 'object' THEN json_set(json_set(value, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)) ELSE value END) FROM json_each(contentCue.Cues)), '[]')
+    WHEN json_type(Cues) = 'object' THEN json_set(json_set(Cues, '$.ContentID', (SELECT new_id FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1)), '$.ContentUUID', (SELECT new_uuid FROM migration_results WHERE source_id = contentCue.ContentID LIMIT 1))
     ELSE Cues
   END"
                     .to_string(),
@@ -4598,10 +4567,26 @@ fn migrate_tracks_in_db(
                 .ok_or_else(|| format!("unexpected migration result row: {row}"))?;
             let mut migrated = output_track.clone();
             migrated.id = new_id.to_string();
+            if let Some(rewrite) = pending_content_cue_rewrites.get_mut(migrated_tracks.len()) {
+                rewrite.new_content_id = new_id.to_string();
+            }
             migrated.source_id = Some(track.id.clone());
             migrated.analysis_state = Some(analysis_state);
             migrated.analysis_note = Some(analysis_note);
             migrated_tracks.push(migrated);
+        }
+
+        if schema_has_column(&schema_columns, "contentCue", "ContentID")
+            && schema_has_column(&schema_columns, "contentCue", "Cues")
+        {
+            rewrite_content_cues_rows(
+                db_path,
+                key,
+                &pending_content_cue_rewrites,
+                now_expr,
+                schema_has_column(&schema_columns, "contentCue", "rb_cue_count"),
+                schema_has_column(&schema_columns, "contentCue", "updated_at"),
+            )?;
         }
 
         Ok(migrated_tracks)
@@ -4964,25 +4949,6 @@ fn scan_impl(req: ScanRequest) -> Result<ScanResponse, String> {
     scan_impl_with_progress(req, |_| {})
 }
 
-fn export_impl(req: ExportRequest) -> Result<ExportResponse, String> {
-    let tracks = scan_tracks(
-        Path::new(&req.db_path),
-        DEFAULT_KEY,
-        req.min_bit_depth,
-        req.include_sampler,
-    )?;
-    let output_path = PathBuf::from(&req.output_path);
-    match req.format.as_str() {
-        "csv" => write_csv_export(&output_path, &tracks)?,
-        "xlsx" => write_xlsx_export(&output_path, &tracks)?,
-        other => return Err(format!("unsupported export format: {other}")),
-    }
-    Ok(ExportResponse {
-        output_path: req.output_path,
-        rows: tracks.len(),
-    })
-}
-
 #[tauri::command]
 fn pick_database_path() -> Option<String> {
     rfd::FileDialog::new()
@@ -4990,22 +4956,6 @@ fn pick_database_path() -> Option<String> {
         .add_filter("rekordbox database", &["db"])
         .set_file_name("master.db")
         .pick_file()
-        .map(|path| path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-fn pick_export_path(format: String, suggested_name: String) -> Option<String> {
-    let filter = if format.to_lowercase() == "xlsx" {
-        ("Excel Workbook", vec!["xlsx"])
-    } else {
-        ("CSV", vec!["csv"])
-    };
-
-    rfd::FileDialog::new()
-        .set_title("Choose export location")
-        .add_filter(filter.0, &filter.1)
-        .set_file_name(suggested_name)
-        .save_file()
         .map(|path| path.to_string_lossy().to_string())
 }
 
@@ -5201,13 +5151,6 @@ async fn scan_library(app: tauri::AppHandle, req: ScanRequest) -> Result<ScanRes
 }
 
 #[tauri::command]
-async fn export_tracks(req: ExportRequest) -> Result<ExportResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || export_impl(req))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
 async fn convert_tracks(
     app: tauri::AppHandle,
     req: ConvertRequest,
@@ -5280,13 +5223,11 @@ pub fn run() {
             default_database_path,
             preflight_check,
             pick_database_path,
-            pick_export_path,
             prepare_preview_path,
             open_path_in_file_manager,
             open_external_url,
             latest_release,
             scan_library,
-            export_tracks,
             rekordbox_process_running,
             convert_tracks
         ])
@@ -5875,6 +5816,76 @@ HKEY_CURRENT_USER\Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}
             fs::read(&db_path).expect("database should be readable"),
             b"original database"
         );
+    }
+
+    #[test]
+    fn rewrites_content_cues_recursively_and_offsets_times() {
+        let (rewritten, cue_count) = rewrite_content_cues_json(
+            r#"[{"ContentID":"1","ContentUUID":"old","CueMsec":1000,"Nested":{"InMsec":2000,"OutMsec":3000,"CueMicrosec":4000000,"InFrame":150,"OutFrame":300,"Label":"1000"}}]"#,
+            "1",
+            "old",
+            "2",
+            "new",
+            23,
+        )
+        .expect("content cues should rewrite");
+        let value: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("rewritten cues should be valid JSON");
+        let cue = value
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("expected first cue");
+        let nested = cue.get("Nested").expect("expected nested cue data");
+
+        assert_eq!(cue_count, 1);
+        assert_eq!(
+            cue.get("ContentID").and_then(|value| value.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            cue.get("ContentUUID").and_then(|value| value.as_str()),
+            Some("new")
+        );
+        assert_eq!(
+            cue.get("CueMsec").and_then(|value| value.as_i64()),
+            Some(1023)
+        );
+        assert_eq!(
+            nested.get("InMsec").and_then(|value| value.as_i64()),
+            Some(2023)
+        );
+        assert_eq!(
+            nested.get("OutMsec").and_then(|value| value.as_i64()),
+            Some(3023)
+        );
+        assert_eq!(
+            nested.get("CueMicrosec").and_then(|value| value.as_i64()),
+            Some(4_023_000)
+        );
+        assert_eq!(
+            nested.get("InFrame").and_then(|value| value.as_i64()),
+            Some(153)
+        );
+        assert_eq!(
+            nested.get("OutFrame").and_then(|value| value.as_i64()),
+            Some(303)
+        );
+        assert_eq!(
+            nested.get("Label").and_then(|value| value.as_str()),
+            Some("1000")
+        );
+    }
+
+    #[test]
+    fn stale_database_conversion_lock_is_removed() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let lock_path = dir.path().join(".rekordport-conversion.lock");
+        fs::write(&lock_path, "pid=999999 db=/tmp/master.db\n")
+            .expect("lock fixture should be written");
+
+        assert!(remove_stale_database_conversion_lock(&lock_path)
+            .expect("stale lock cleanup should succeed"));
+        assert!(!lock_path.exists());
     }
 
     #[test]

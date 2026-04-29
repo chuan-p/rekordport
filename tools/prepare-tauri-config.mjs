@@ -109,25 +109,40 @@ function verifyWindowsSidecarHash(command, targetTriple, filePath) {
   }
 }
 
+function windowsSidecarHashValid(command, targetTriple, filePath) {
+  if (!targetTriple.includes("windows")) return true;
+  const expected = pinnedWindowsSidecarSha256.get(`${targetTriple}:${command}`);
+  if (!expected || !existsSync(filePath)) return false;
+  const actual = createHash("sha256").update(readFileSync(filePath)).digest("hex");
+  return actual === expected;
+}
+
+function shouldSkipMismatchedCrossHostWindowsSidecar(command, targetTriple, filePath) {
+  return targetTriple.includes("windows")
+    && process.platform !== "win32"
+    && existsSync(filePath)
+    && !windowsSidecarHashValid(command, targetTriple, filePath);
+}
+
 function ensureWindowsSidecars(targetTriple) {
   if (!targetTriple.includes("windows")) return;
   if (process.platform !== "win32") return;
   if (!shouldAutoFetchWindowsSidecars()) return;
 
   const commands = ["sqlcipher", "ffmpeg"];
-  const missing = commands.filter((command) => {
+  const needsRefresh = commands.filter((command) => {
     const sourcePath = path.join(tauriDir, "bin", sidecarFilename(command, targetTriple));
-    return !existsSync(sourcePath);
+    return !windowsSidecarHashValid(command, targetTriple, sourcePath);
   });
 
-  if (missing.length === 0) return;
+  if (needsRefresh.length === 0) return;
 
   const scriptPath = path.join(repoRoot, "tools", "fetch-windows-sidecars.ps1");
   const shells = ["powershell.exe", "pwsh"];
   let lastError = null;
 
   console.log(
-    `[tauri-config] missing Windows sidecars for ${targetTriple}: ${missing.join(", ")}`
+    `[tauri-config] missing or mismatched Windows sidecars for ${targetTriple}: ${needsRefresh.join(", ")}`
   );
   console.log("[tauri-config] fetching Windows sidecars automatically...");
 
@@ -448,6 +463,10 @@ ensureCleanDir(generatedResourceDir);
 for (const entry of externalBins) {
   const command = path.basename(entry);
   const sourcePath = path.join(tauriDir, path.dirname(entry), sidecarFilename(command, targetTriple));
+  if (shouldSkipMismatchedCrossHostWindowsSidecar(command, targetTriple, sourcePath)) {
+    skippedBins.push(`${path.relative(repoRoot, sourcePath)} (SHA-256 mismatch)`);
+    continue;
+  }
   if (!existsSync(sourcePath)) {
     skippedBins.push(path.relative(repoRoot, sourcePath));
     continue;

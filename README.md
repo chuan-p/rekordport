@@ -34,7 +34,7 @@ rekordport is a tool for scanning a rekordbox library, finding hi-res files CDJs
 - `rekordport` modifies your rekordbox database during conversion.
 - The app creates backups first, but you should still keep your own library backup.
 - After a successful conversion, the latest database backup is retained. Temporary full music backups are removed after success; renamed source files are either kept next to the converted file or moved to Trash, depending on the selected source handling mode.
-- Smart playlists are not rewritten yet.
+- Smart playlists are rule-based; rekordbox refreshes them when the library opens.
 - `MP3` and `M4A` now preserve embedded cover art when the source contains attached artwork.
 - `AIFF` attempts to preserve embedded artwork on a best-effort basis.
 - `WAV` output does not preserve embedded cover art.
@@ -116,8 +116,6 @@ See [src-tauri/bin/README.md](src-tauri/bin/README.md) for sidecar naming and pa
 
 ## Current Limitations
 
-- Smart playlist migration is not implemented yet.
-- rekordbox USB export behavior may still keep old files depending on rekordbox's own sync rules.
 - If analysis resources are already broken or inconsistent, conversion stops instead of trying to guess.
 - `WAV` cover art is not preserved.
 

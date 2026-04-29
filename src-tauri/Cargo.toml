@@ -25,7 +25,6 @@ tempfile = "3"
 trash = "5"
 ureq = "2.12"
 uuid = { version = "1", features = ["v4"] }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 [profile.dev]
 incremental = true
