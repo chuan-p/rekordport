@@ -1,17 +1,26 @@
 # Changelog
 
-## 0.3.2 - 2026-04-29
+## 0.3.3 - 2026-04-29
 
 ### Added
 
 - Added a Rekordbox review playlist for each successful conversion, containing the tracks converted in that run.
 - Added a backup link to the info card so the retained recovery backup can be opened directly after conversion.
+- Added per-library conversion lock files so two rekordport processes cannot convert or recover the same library at the same time.
+- Added recursive `contentCue.Cues` migration for cue IDs and timestamp fields, including nested cue JSON values.
 
 ### Fixed
 
 - Fixed review playlists being hidden in Rekordbox by creating them as normal root playlists instead of inheriting deleted or special playlist state from an existing template.
 - Fixed false "Close rekordbox before converting" warnings on macOS by matching the Rekordbox executable name exactly instead of substring-matching process paths.
 - Improved FLAC/ALAC bitrate display when Rekordbox stores a zero bitrate by resolving Rekordbox file paths more robustly and deriving an average bitrate when ffmpeg reports `N/A`.
+- Fixed same-format interrupted-conversion recovery so an original source file is never deleted when the manifest output path is the same as the source path.
+- Fixed current-track rollback so source-restore failures are reported and recovery manifests are preserved instead of being silently removed.
+- Fixed migration failure rollback so `master.db` is restored from the database backup, with restore failures included in the returned error.
+- Fixed stale preview and progress-event races by tagging scan and conversion progress with operation IDs and ignoring old async results.
+- Fixed backend conversion safety by enforcing the Rekordbox process check in Rust, not only in the frontend.
+- Fixed numeric text ID generation to ignore nonnumeric IDs that merely start with a digit.
+- Fixed the Windows release upload cleanup step to delete the actual dated portable executable asset name.
 
 ### Improved
 
@@ -19,6 +28,16 @@
 - Clarified the info card label.
 - Renamed new conversion backup folders from `rkb-lossless-backup-*` to `rekordport-backup-*`, while keeping recovery and cleanup compatible with older backup folders.
 - After a successful conversion, full music backups are cleaned automatically while the latest recovery `master.db` backup is retained.
+- Clarified that smart playlists are rule-based; Rekordbox refreshes them when the library opens.
+- Hardened external tool resolution: invalid environment overrides now fail loudly, development sidecar lookup no longer accepts arbitrary working-directory executables, and system `PATH` remains the final fallback.
+- Hardened Windows sidecar packaging by verifying pinned SHA-256 hashes during staging and embedding, blocking unverified downloads in CI, and refreshing mismatched sidecars during Windows preparation.
+- Added a timeout to startup update checks.
+- Added preview cache cleanup with age and size limits.
+- Added SQLite JSON function preflight checks before conversion.
+
+### Removed
+
+- Removed the unused backend CSV/XLSX export commands and their `zip` dependency.
 
 ## 0.3.0 - 2026-04-27
 
