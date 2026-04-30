@@ -616,6 +616,14 @@ fn sidecar_filename(command: &str) -> String {
     }
 }
 
+fn bundled_command_filenames(command: &str) -> Vec<String> {
+    let mut names = vec![sidecar_filename(command)];
+    if !names.iter().any(|name| name == command) {
+        names.push(command.to_string());
+    }
+    names
+}
+
 include!(concat!(env!("OUT_DIR"), "/embedded_windows_sidecars.rs"));
 
 fn embedded_windows_sidecar_path(command: &str) -> Option<PathBuf> {
@@ -669,9 +677,11 @@ fn candidate_search_roots() -> Vec<PathBuf> {
                 push_root(contents_dir.to_path_buf());
                 push_root(contents_dir.join("Resources"));
                 push_root(contents_dir.join("Resources").join("bin"));
+                push_root(contents_dir.join("Resources").join("sidecars"));
                 if let Some(app_dir) = contents_dir.parent() {
                     push_root(app_dir.join("Resources"));
                     push_root(app_dir.join("Resources").join("bin"));
+                    push_root(app_dir.join("Resources").join("sidecars"));
                 }
             }
         }
@@ -1143,11 +1153,13 @@ fn resolve_command(command: &str) -> Option<PathBuf> {
             }
         }
 
-        let sidecar = sidecar_filename(command);
+        let sidecars = bundled_command_filenames(command);
         for root in candidate_search_roots() {
-            let candidate = root.join(&sidecar);
-            if candidate.exists() && command_exists_at(&candidate) {
-                return Some(candidate);
+            for sidecar in &sidecars {
+                let candidate = root.join(sidecar);
+                if candidate.exists() && command_exists_at(&candidate) {
+                    return Some(candidate);
+                }
             }
         }
 
@@ -5245,6 +5257,21 @@ mod tests {
         } else {
             value.replace('\\', "/")
         }
+    }
+
+    #[test]
+    fn bundled_command_filenames_include_tauri_packaged_name() {
+        let names = bundled_command_filenames("sqlcipher");
+        let target_specific_name = sidecar_filename("sqlcipher");
+
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some(target_specific_name.as_str())
+        );
+        assert!(
+            names.iter().any(|name| name == "sqlcipher"),
+            "Tauri packages external binaries without the target triple in the app bundle"
+        );
     }
 
     #[test]
