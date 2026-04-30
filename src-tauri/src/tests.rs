@@ -39,6 +39,19 @@ fn normalizes_windows_path_strings() {
     );
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn normalizes_windows_rekordbox_file_urls() {
+    assert_eq!(
+        normalize_rekordbox_path_value("file://localhost/C:/Music/My%20Track.flac"),
+        r"C:/Music/My Track.flac"
+    );
+    assert_eq!(
+        normalize_rekordbox_path_value("file://server/share/Music/My%20Track.flac"),
+        r"\\server\share\Music\My Track.flac"
+    );
+}
+
 #[test]
 fn chooses_windows_preview_strategy() {
     assert_eq!(

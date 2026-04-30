@@ -239,9 +239,18 @@ fn normalize_rekordbox_path_value(value: &str) -> String {
 
     #[cfg(target_os = "windows")]
     {
+        let is_file_url = trimmed.starts_with("file://");
         let bytes = decoded.as_bytes();
         if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
             return decoded[1..].to_string();
+        }
+        if is_file_url
+            && !trimmed.starts_with("file://localhost")
+            && !decoded.starts_with('/')
+            && !decoded.starts_with('\\')
+            && !decoded.contains(':')
+        {
+            return format!("\\\\{}", decoded.replace('/', "\\"));
         }
     }
 
