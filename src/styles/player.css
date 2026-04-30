@@ -1,0 +1,30 @@
+.player-panel {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(24, 24, 27, 0.98);
+}
+
+.player-meter {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  color: var(--muted);
+}
+
+.player-meter input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.player-play {
+  min-width: 92px;
+  padding-inline: 18px;
+}
+
+audio {
+  display: none;
+}

@@ -1,0 +1,248 @@
+.shell {
+  position: relative;
+  z-index: 1;
+  max-width: 1600px;
+  height: calc(100vh - 24px);
+  margin: 0 auto;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+html.platform-macos .shell {
+  height: calc(100vh - 56px);
+}
+
+.panel {
+  position: relative;
+  overflow: hidden;
+  border-radius: 24px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: var(--shadow-lg);
+}
+
+.panel::before {
+  display: none;
+}
+
+.scan-panel,
+.results-panel,
+.export-panel {
+  padding: 16px 18px;
+}
+
+.scan-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.scan-grid > .field-group:first-child {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.compact-toggle {
+  grid-row: 2 / 3;
+  grid-column: 1 / 2;
+  min-width: 0;
+}
+
+.scan-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.scan-progress[hidden],
+.export-progress[hidden] {
+  display: none;
+}
+
+.scan-progress progress,
+.export-progress progress {
+  width: 100%;
+  height: 8px;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.scan-progress progress::-webkit-progress-bar,
+.export-progress progress::-webkit-progress-bar {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+}
+
+.scan-progress progress::-webkit-progress-value,
+.export-progress progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: #e7e9ec;
+}
+
+.scan-progress progress::-moz-progress-bar,
+.export-progress progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: #e7e9ec;
+}
+
+.scan-progress-text,
+.export-progress-text {
+  min-width: 148px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.results-panel {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(220px, 1fr) auto;
+  gap: 12px;
+}
+
+.panel-title {
+  margin: 0;
+}
+
+.panel-title h2 {
+  margin: 0;
+  font-size: 1.02rem;
+}
+
+.results-title {
+  position: relative;
+  display: block;
+  min-height: 32px;
+  padding-right: min(52%, 640px);
+}
+
+.export-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.export-toolbar {
+  display: grid;
+  grid-template-columns: max-content minmax(18px, 1fr) max-content minmax(18px, 1fr) max-content;
+  gap: 10px;
+  align-items: center;
+}
+
+.export-toolbar .primary {
+  grid-column: 5 / 6;
+  justify-self: end;
+  width: 260px;
+  white-space: nowrap;
+}
+
+.inline-field {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.inline-field label {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.inline-field select {
+  min-width: 0;
+}
+
+.format-field {
+  grid-column: 1 / 2;
+  justify-self: start;
+  grid-template-columns: auto 188px;
+}
+
+.source-field {
+  grid-column: 3 / 4;
+  width: auto;
+}
+
+.export-toolbar > .inline-field:not(.format-field):not(.source-field) {
+  min-width: 0;
+  justify-self: stretch;
+}
+
+.export-toolbar > .inline-field:not(.format-field):not(.source-field) select {
+  min-width: 0;
+}
+
+.export-toolbar > .source-field {
+  display: inline-grid;
+  justify-self: start;
+  width: auto;
+  max-width: none;
+  grid-template-columns: auto 420px;
+}
+
+.source-field select {
+  width: 420px;
+}
+
+.footer-copy {
+  min-width: 0;
+  align-self: center;
+  grid-column: 1 / -1;
+  font-size: 0.84rem;
+}
+
+.footer-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  line-height: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.footer-link:hover {
+  color: var(--accent);
+}
+
+.footer-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.footer-meta .footer-note {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.footer-copy[hidden] {
+  display: none;
+}
+
+.export-progress {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.footer-error {
+  color: #ffd5d9;
+  background: rgba(255, 139, 148, 0.12);
+  border: 1px solid rgba(255, 139, 148, 0.25);
+  border-radius: 14px;
+  padding: 12px 14px;
+}

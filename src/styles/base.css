@@ -1,0 +1,78 @@
+:root {
+  color-scheme: dark;
+  font-family: "Avenir Next", "IBM Plex Sans", "Segoe UI", sans-serif;
+  --bg-0: #151517;
+  --bg-1: #1c1c1f;
+  --panel: rgba(30, 30, 33, 0.98);
+  --panel-soft: rgba(38, 38, 42, 0.96);
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.11);
+  --text: #f2f3f5;
+  --muted: rgba(242, 243, 245, 0.62);
+  --accent: #f2f3f5;
+  --success: #d9dde3;
+  --danger: #ff8b94;
+  --shadow-lg: 0 24px 70px rgba(0, 0, 0, 0.44);
+  --shadow-md: 0 14px 28px rgba(0, 0, 0, 0.26);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: linear-gradient(180deg, var(--bg-1), var(--bg-0));
+  color: var(--text);
+}
+
+body {
+  padding: 12px;
+  overflow: hidden;
+  font-feature-settings: "tnum" 1;
+  background: linear-gradient(180deg, var(--bg-1), var(--bg-0));
+}
+
+html.platform-macos body {
+  padding-top: 44px;
+}
+
+body::before {
+  display: none;
+}
+
+.noise-layer {
+  display: none;
+}
+
+.backdrop {
+  display: none;
+}
+
+.backdrop-a {
+  display: none;
+}
+
+.backdrop-b {
+  display: none;
+}
+
+.window-drag-bar {
+  display: none;
+}
+
+html.platform-macos .window-drag-bar {
+  display: block;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  z-index: 20;
+  pointer-events: auto;
+  cursor: grab;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
