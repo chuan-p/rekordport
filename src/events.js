@@ -6,7 +6,7 @@ import { numberOrZero } from "./utils.js";
 import { convertSelected } from "./convert-flow.js";
 import { invalidateScanState, pickDatabase, refreshPreflight, scan } from "./scan-flow.js";
 import { attemptPreviewPlayback, loadPreviewTrack, previewErrorMessage, previewTrack, renderPlayer, togglePreviewPlay } from "./preview-player.js";
-import { applyPreflightState, closeProfileCard, renderChips, renderProfileCard, renderResults, renderScanProgress, renderSummary, setConvertProgress, setError, setScanProgress, setStatus, toggleProfileCard } from "./render-results.js";
+import { applyPreflightState, closeProfileCard, renderChips, renderProfileCard, renderResults, renderScanProgress, renderSummary, selectableTracks, setConvertProgress, setError, setScanProgress, setStatus, toggleProfileCard } from "./render-results.js";
 
 async function wireEvents() {
   await listenEvent("scan-progress", (event) => {

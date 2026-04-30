@@ -145,6 +145,29 @@ fn resolves_rekordbox_folder_path_with_file_name() {
 }
 
 #[test]
+fn resolved_rekordbox_audio_path_filters_missing_files() {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let row = ScanRow {
+        id: "1".to_string(),
+        title: "Track".to_string(),
+        artist: "Artist".to_string(),
+        file_type: 5,
+        bit_depth: None,
+        sample_rate: None,
+        bitrate: None,
+        full_path: dir
+            .path()
+            .join("Missing.flac")
+            .to_string_lossy()
+            .to_string(),
+        file_name_l: String::new(),
+        file_name_s: String::new(),
+    };
+
+    assert_eq!(resolve_existing_rekordbox_audio_path(&row), None);
+}
+
+#[test]
 fn derives_bitrate_from_duration_and_file_size_when_ffmpeg_reports_na() {
     let mut probe = parse_ffmpeg_audio_probe(
             "Input #0, flac, from 'song.flac':\n  Duration: 00:03:00.00, start: 0.000000, bitrate: N/A\n  Stream #0:0: Audio: flac, 44100 Hz, stereo, s24",

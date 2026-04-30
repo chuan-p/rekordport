@@ -280,6 +280,16 @@ fn resolve_rekordbox_audio_path(folder_path: &str, file_name_l: &str, file_name_
     base
 }
 
+fn resolve_existing_rekordbox_audio_path(row: &ScanRow) -> Option<String> {
+    let full_path =
+        resolve_rekordbox_audio_path(&row.full_path, &row.file_name_l, &row.file_name_s);
+    if full_path.trim().is_empty() || !path_is_file(Path::new(&full_path)) {
+        return None;
+    }
+
+    Some(full_path)
+}
+
 fn build_scan_query(min_bit_depth: u32, include_sampler: bool) -> String {
     let sampler_filter = if include_sampler {
         String::new()
@@ -381,23 +391,31 @@ where
         let mut scan_issue = None;
         let mut scan_note = None;
         let mut include_track = matches!(row.file_type, 5 | 6) || hi_res_pcm;
-        let full_path =
-            resolve_rekordbox_audio_path(&row.full_path, &row.file_name_l, &row.file_name_s);
+        let Some(full_path) = resolve_existing_rekordbox_audio_path(&row) else {
+            let current = index + 1;
+            if current == total || current == 1 || current % progress_step == 0 {
+                on_progress(ScanProgressPayload {
+                    phase: "processing".to_string(),
+                    current,
+                    total,
+                    message: format!("Inspecting {current} / {total} candidate tracks…"),
+                });
+            }
+            continue;
+        };
         let row = ScanRow { full_path, ..row };
 
-        if row.file_type == 11 && !hi_res_pcm && !row.full_path.trim().is_empty() {
+        if row.file_type == 11 && !hi_res_pcm {
             let source = Path::new(&row.full_path);
-            if path_is_file(source) {
-                if let Some(WAV_FORMAT_TAG_EXTENSIBLE) =
-                    probe_wav_format_tag(source).unwrap_or(None)
-                {
-                    include_track = true;
-                    stats.wav_extensible += 1;
-                    scan_issue = Some("wav_extensible".to_string());
-                    scan_note = Some(
-                        "WAV header uses WAVE_FORMAT_EXTENSIBLE. Some CDJ/XDJ players reject these files even when the bit depth and sample rate look compatible.".to_string(),
-                    );
-                }
+            if let Some(WAV_FORMAT_TAG_EXTENSIBLE) =
+                probe_wav_format_tag(source).unwrap_or(None)
+            {
+                include_track = true;
+                stats.wav_extensible += 1;
+                scan_issue = Some("wav_extensible".to_string());
+                scan_note = Some(
+                    "WAV header uses WAVE_FORMAT_EXTENSIBLE. Some CDJ/XDJ players reject these files even when the bit depth and sample rate look compatible.".to_string(),
+                );
             }
         }
 

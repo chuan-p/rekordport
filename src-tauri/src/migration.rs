@@ -800,7 +800,7 @@ fn add_json_u64_offset(value: &mut serde_json::Value, offset: u64, include_zero:
 }
 
 fn decode_hex_text(hex: &str) -> Result<String, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("hex text has an odd number of characters".to_string());
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);

@@ -161,7 +161,7 @@ fn process_id_running(pid: u32) -> bool {
             .args(["-0", &pid.to_string()])
             .stderr(Stdio::null())
             .status();
-        return status.map(|status| status.success()).unwrap_or(true);
+        status.map(|status| status.success()).unwrap_or(true)
     }
 }
 
