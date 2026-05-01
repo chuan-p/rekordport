@@ -39,6 +39,14 @@ fn normalizes_windows_path_strings() {
     );
 }
 
+#[test]
+fn explorer_select_argument_quotes_paths_with_spaces() {
+    assert_eq!(
+        windows_explorer_select_arg(r"D:\Music\Other\2 Unlimited - Twilight Zone.aiff"),
+        r#"/select,"D:\Music\Other\2 Unlimited - Twilight Zone.aiff""#
+    );
+}
+
 #[cfg(target_os = "windows")]
 #[test]
 fn normalizes_windows_rekordbox_file_urls() {

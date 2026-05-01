@@ -13,6 +13,11 @@ fn prepare_preview_path(path: String) -> Result<String, String> {
     prepare_preview_path_impl(path)
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_explorer_select_arg(path: &str) -> String {
+    format!("/select,\"{path}\"")
+}
+
 #[tauri::command]
 fn open_path_in_file_manager(path: String) -> Result<(), String> {
     let path = PathBuf::from(path);
@@ -46,7 +51,7 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
         if path.is_dir() {
             command.arg(&normalized);
         } else {
-            command.arg(format!("/select,{}", normalized));
+            command.raw_arg(windows_explorer_select_arg(&normalized));
         }
 
         let status = command.status().map_err(|e| e.to_string())?;
