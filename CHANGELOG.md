@@ -7,6 +7,7 @@
 - Fixed the Select All checkbox in scan results after the frontend controller split.
 - Scan Library now filters out Rekordbox entries whose resolved audio files no longer exist on disk.
 - Improved Windows Rekordbox path handling for local `file://localhost/C:/...` paths and UNC `file://server/share/...` paths before checking whether files exist.
+- Normalized Windows UNC file URLs that Rekordbox stores with an extra slash, such as `file:////server/share/...`, before missing-file filtering.
 - After conversion, the footer now shows the conversion result instead of leaving the environment-ready message in place.
 
 ### Improved

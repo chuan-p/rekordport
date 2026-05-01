@@ -246,11 +246,15 @@ fn normalize_rekordbox_path_value(value: &str) -> String {
         }
         if is_file_url
             && !trimmed.starts_with("file://localhost")
-            && !decoded.starts_with('/')
-            && !decoded.starts_with('\\')
             && !decoded.contains(':')
+            && (!decoded.starts_with('/')
+                || decoded.starts_with("//")
+                || decoded.starts_with("\\\\"))
         {
-            return format!("\\\\{}", decoded.replace('/', "\\"));
+            let unc_path = decoded.trim_start_matches(['/', '\\']).replace('/', "\\");
+            if !unc_path.is_empty() {
+                return format!("\\\\{unc_path}");
+            }
         }
     }
 

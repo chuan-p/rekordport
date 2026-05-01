@@ -50,6 +50,10 @@ fn normalizes_windows_rekordbox_file_urls() {
         normalize_rekordbox_path_value("file://server/share/Music/My%20Track.flac"),
         r"\\server\share\Music\My Track.flac"
     );
+    assert_eq!(
+        normalize_rekordbox_path_value("file:////server/share/Music/My%20Track.flac"),
+        r"\\server\share\Music\My Track.flac"
+    );
 }
 
 #[test]
