@@ -1,13 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.3.4 - 2026-05-05
 
 ### Fixed
 
 - Fixed the Select All checkbox in scan results after the frontend controller split.
 - Scan Library now filters out Rekordbox entries whose resolved audio files no longer exist on disk.
-- Improved Windows Rekordbox path handling for local `file://localhost/C:/...` paths and UNC `file://server/share/...` paths before checking whether files exist.
-- Normalized Windows UNC file URLs that Rekordbox stores with an extra slash, such as `file:////server/share/...`, before missing-file filtering.
+- Improved Windows Rekordbox path handling before missing-file filtering for local `file://localhost/C:/...` paths, UNC `file://server/share/...` paths, and extra-slash UNC paths such as `file:////server/share/...`.
 - Fixed Windows file-path reveal for paths with spaces by passing Explorer's `/select` argument in the native quoted form.
 - After conversion, the footer now shows the conversion result instead of leaving the environment-ready message in place.
 
@@ -15,7 +14,6 @@
 
 - Split the large Rust backend, frontend controller, and CSS files into focused modules while keeping existing Tauri command names and request payloads unchanged.
 - Moved Rust tests out of the main backend entry file and removed unused backend/frontend helpers.
-- Verified the current Windows portable build through GitHub Actions, including project checks, release build, and executable smoke test.
 
 ## 0.3.3 - 2026-04-29
 
