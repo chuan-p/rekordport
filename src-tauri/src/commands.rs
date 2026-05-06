@@ -13,9 +13,15 @@ fn prepare_preview_path(path: String) -> Result<String, String> {
     prepare_preview_path_impl(path)
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn windows_explorer_select_arg(path: &str) -> String {
-    format!("/select,\"{path}\"")
+#[cfg(any(target_os = "windows", all(not(target_os = "macos"), not(target_os = "windows")), test))]
+fn file_manager_folder_target(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    }
 }
 
 #[tauri::command]
@@ -46,18 +52,15 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let normalized = normalized_user_path_string(&path);
+        let target = file_manager_folder_target(&path);
+        let normalized = normalized_user_path_string(&target);
         let mut command = Command::new("explorer");
-        if path.is_dir() {
-            command.arg(&normalized);
-        } else {
-            command.raw_arg(windows_explorer_select_arg(&normalized));
-        }
+        command.arg(&normalized);
 
         command.spawn().map_err(|e| {
             format!(
                 "failed to open path in the file manager: {} ({e})",
-                path.display()
+                target.display()
             )
         })?;
         Ok(())
@@ -65,13 +68,7 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let target = if path.is_dir() {
-            path
-        } else {
-            path.parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| path.to_path_buf())
-        };
+        let target = file_manager_folder_target(&path);
 
         let status = Command::new("xdg-open")
             .arg(&target)

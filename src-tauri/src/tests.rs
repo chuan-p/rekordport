@@ -40,10 +40,15 @@ fn normalizes_windows_path_strings() {
 }
 
 #[test]
-fn explorer_select_argument_quotes_paths_with_spaces() {
+fn file_manager_target_uses_parent_for_files() {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let file = dir.path().join("Track With Spaces.flac");
+    fs::write(&file, b"audio").expect("file fixture should be written");
+
+    assert_eq!(file_manager_folder_target(&file), dir.path().to_path_buf());
     assert_eq!(
-        windows_explorer_select_arg(r"D:\Music\Other\2 Unlimited - Twilight Zone.aiff"),
-        r#"/select,"D:\Music\Other\2 Unlimited - Twilight Zone.aiff""#
+        file_manager_folder_target(dir.path()),
+        dir.path().to_path_buf()
     );
 }
 
