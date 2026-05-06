@@ -54,14 +54,13 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
             command.raw_arg(windows_explorer_select_arg(&normalized));
         }
 
-        let status = command.status().map_err(|e| e.to_string())?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(format!(
-            "failed to open path in the file manager: {}",
-            path.display()
-        ));
+        command.spawn().map_err(|e| {
+            format!(
+                "failed to open path in the file manager: {} ({e})",
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
