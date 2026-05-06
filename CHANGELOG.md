@@ -8,6 +8,7 @@
 - Scan Library now filters out Rekordbox entries whose resolved audio files no longer exist on disk.
 - Improved Windows Rekordbox path handling before missing-file filtering for local `file://localhost/C:/...` paths, UNC `file://server/share/...` paths, and extra-slash UNC paths such as `file:////server/share/...`.
 - Windows file-path clicks now open the containing folder instead of passing the audio file path to Explorer, avoiding accidental file launches and false reveal errors from Explorer exit codes.
+- Split folder-opening commands so scan result paths open their containing folder, backup links open the folder itself, and errors distinguish missing paths, non-folder paths, missing containing folders, and file manager launch failures.
 - After conversion, the footer now shows the conversion result instead of leaving the environment-ready message in place.
 
 ### Improved

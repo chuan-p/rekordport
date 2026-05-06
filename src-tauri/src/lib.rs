@@ -53,6 +53,8 @@ pub fn run() {
             preflight_check,
             pick_database_path,
             prepare_preview_path,
+            open_folder,
+            open_containing_folder,
             open_path_in_file_manager,
             open_external_url,
             latest_release,

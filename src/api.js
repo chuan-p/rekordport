@@ -6,8 +6,12 @@ export const invokeCommand = invoke;
 export const listenEvent = listen;
 export const assetSrc = convertFileSrc;
 
-export async function openPathInFileManager(path) {
-  await invoke("open_path_in_file_manager", { path });
+export async function openFolder(path) {
+  await invoke("open_folder", { path });
+}
+
+export async function openContainingFolder(path) {
+  await invoke("open_containing_folder", { path });
 }
 
 export async function openExternalUrl(url) {

@@ -1,5 +1,5 @@
 import { IS_MACOS, els, state } from "./app-state.js";
-import { invokeCommand, listenEvent, openExternalUrl, openPathInFileManager } from "./api.js";
+import { invokeCommand, listenEvent, openContainingFolder, openExternalUrl, openFolder } from "./api.js";
 import { checkForUpdates, renderUpdateDialog, skipUpdateVersion } from "./updates.js";
 import { loadSettings, normalizeSettings, saveSettings } from "./settings.js";
 import { numberOrZero } from "./utils.js";
@@ -101,7 +101,7 @@ async function wireEvents() {
       if (!path) return;
 
       try {
-        await openPathInFileManager(path);
+        await openContainingFolder(path);
       } catch (error) {
         setStatus("Error", "", "error");
         setError(String(error));
@@ -119,7 +119,7 @@ async function wireEvents() {
     if (!path) return;
 
     try {
-      await openPathInFileManager(path);
+      await openFolder(path);
     } catch (error) {
       setStatus("Error", "", "error");
       setError(String(error));

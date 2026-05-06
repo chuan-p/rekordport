@@ -13,54 +13,67 @@ fn prepare_preview_path(path: String) -> Result<String, String> {
     prepare_preview_path_impl(path)
 }
 
-#[cfg(any(target_os = "windows", all(not(target_os = "macos"), not(target_os = "windows")), test))]
-fn file_manager_folder_target(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.to_path_buf())
+fn require_existing_folder(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!("folder does not exist: {}", path.display()));
     }
+    if !path.is_dir() {
+        return Err(format!("path is not a folder: {}", path.display()));
+    }
+    Ok(())
 }
 
-#[tauri::command]
-fn open_path_in_file_manager(path: String) -> Result<(), String> {
-    let path = PathBuf::from(path);
+fn containing_folder_target(path: &Path) -> Result<PathBuf, String> {
     if !path.exists() {
-        return Err(format!("path not found: {}", path.display()));
+        return Err(format!("path does not exist: {}", path.display()));
+    }
+    if path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+    if !path.is_file() {
+        return Err(format!("path is neither a file nor a folder: {}", path.display()));
     }
 
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("file has no containing folder: {}", path.display()))?;
+    require_existing_folder(parent).map_err(|error| {
+        format!(
+            "containing folder is unavailable for {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(parent.to_path_buf())
+}
+
+fn open_folder_in_file_manager(folder: &Path) -> Result<(), String> {
+    require_existing_folder(folder)?;
     #[cfg(target_os = "macos")]
     {
-        let mut command = Command::new("open");
-        if path.is_dir() {
-            command.arg(&path);
-        } else {
-            command.args(["-R"]).arg(&path);
-        }
+        let status = Command::new("open")
+            .arg(folder)
+            .status()
+            .map_err(|e| format!("failed to launch file manager for {}: {e}", folder.display()))?;
 
-        let status = command.status().map_err(|e| e.to_string())?;
         if status.success() {
             return Ok(());
         }
         Err(format!(
-            "failed to open path in the file manager: {}",
-            path.display()
+            "file manager exited unsuccessfully while opening folder: {}",
+            folder.display()
         ))
     }
 
     #[cfg(target_os = "windows")]
     {
-        let target = file_manager_folder_target(&path);
-        let normalized = normalized_user_path_string(&target);
-        let mut command = Command::new("explorer");
-        command.arg(&normalized);
+        let normalized = normalized_user_path_string(folder);
 
+        let mut command = Command::new("explorer");
+        command.arg(normalized);
         command.spawn().map_err(|e| {
             format!(
-                "failed to open path in the file manager: {} ({e})",
-                target.display()
+                "failed to launch file manager for folder {}: {e}",
+                folder.display()
             )
         })?;
         Ok(())
@@ -68,18 +81,37 @@ fn open_path_in_file_manager(path: String) -> Result<(), String> {
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let target = file_manager_folder_target(&path);
-
         let status = Command::new("xdg-open")
-            .arg(&target)
+            .arg(folder)
             .status()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("failed to launch file manager for {}: {e}", folder.display()))?;
 
         if status.success() {
             return Ok(());
         }
-        return Err(format!("failed to open path: {}", target.display()));
+        return Err(format!(
+            "file manager exited unsuccessfully while opening folder: {}",
+            folder.display()
+        ));
     }
+}
+
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    let folder = PathBuf::from(path);
+    open_folder_in_file_manager(&folder)
+}
+
+#[tauri::command]
+fn open_containing_folder(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let folder = containing_folder_target(&path)?;
+    open_folder_in_file_manager(&folder)
+}
+
+#[tauri::command]
+fn open_path_in_file_manager(path: String) -> Result<(), String> {
+    open_containing_folder(path)
 }
 
 #[tauri::command]

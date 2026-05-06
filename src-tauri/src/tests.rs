@@ -45,11 +45,29 @@ fn file_manager_target_uses_parent_for_files() {
     let file = dir.path().join("Track With Spaces.flac");
     fs::write(&file, b"audio").expect("file fixture should be written");
 
-    assert_eq!(file_manager_folder_target(&file), dir.path().to_path_buf());
     assert_eq!(
-        file_manager_folder_target(dir.path()),
+        containing_folder_target(&file).expect("file should resolve to its parent"),
         dir.path().to_path_buf()
     );
+    assert_eq!(
+        containing_folder_target(dir.path()).expect("folder should resolve to itself"),
+        dir.path().to_path_buf()
+    );
+}
+
+#[test]
+fn folder_open_errors_distinguish_files_from_missing_paths() {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let file = dir.path().join("Track.flac");
+    let missing = dir.path().join("Missing");
+    fs::write(&file, b"audio").expect("file fixture should be written");
+
+    assert!(require_existing_folder(&file)
+        .expect_err("file path should not be accepted as a folder")
+        .contains("path is not a folder"));
+    assert!(containing_folder_target(&missing)
+        .expect_err("missing path should be reported distinctly")
+        .contains("path does not exist"));
 }
 
 #[cfg(target_os = "windows")]
